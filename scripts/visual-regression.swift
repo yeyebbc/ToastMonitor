@@ -166,16 +166,39 @@ guard let expected = try JSONSerialization.jsonObject(with: expectedData) as? [S
                   userInfo: [NSLocalizedDescriptionKey: "invalid baseline file"])
 }
 var failures: [String] = []
+var failedPopoverScenes: [String] = []
 for scenario in scenarios {
     guard let expectedHash = expected[scenario.name], let actualHash = actual[scenario.name] else {
         failures.append("\(scenario.name): missing hash")
+        if scenario.name.hasPrefix("popover-home-") {
+            failedPopoverScenes.append(scenario.name)
+        }
         continue
     }
     let distance = hammingDistance(expectedHash, actualHash)
     if distance > 20 {
-        failures.append("\(scenario.name): distance \(distance) > 20")
+        failures.append("\(scenario.name): distance \(distance) > 20 (expected \(expectedHash), actual \(actualHash))")
+        if scenario.name.hasPrefix("popover-home-") {
+            failedPopoverScenes.append(scenario.name)
+        }
     } else {
         print("\(scenario.name): distance \(distance)")
+    }
+}
+if !failures.isEmpty,
+   !failedPopoverScenes.isEmpty,
+   let artifactPath = ProcessInfo.processInfo.environment["TM_VISUAL_ARTIFACT_DIR"] {
+    let artifactDirectory = URL(fileURLWithPath: artifactPath, isDirectory: true)
+    do {
+        try fileManager.createDirectory(at: artifactDirectory, withIntermediateDirectories: true)
+        for name in failedPopoverScenes {
+            let source = tempRoot.appendingPathComponent("\(name).png")
+            let destination = artifactDirectory.appendingPathComponent("\(name).png")
+            try fileManager.copyItem(at: source, to: destination)
+        }
+        print("saved failing popover captures to \(artifactDirectory.path)")
+    } catch {
+        fputs("warning: could not save failing popover captures: \(error)\n", stderr)
     }
 }
 guard failures.isEmpty else {
