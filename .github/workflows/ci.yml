@@ -85,6 +85,38 @@ jobs:
           path: ${{ runner.temp }}/visual-regression-failure/*
           if-no-files-found: ignore
 
+  ci-bundle:
+    if: github.ref == 'refs/heads/main'
+    needs: build-and-test
+    runs-on: xcode-27
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Assemble universal development app
+        env:
+          TM_ARCHS: arm64 x86_64
+          TM_VERSION: "1.0"
+          TM_BUILD_NUMBER: ${{ github.run_number }}
+          TM_ALLOW_UNSIGNED: "1"
+          TM_SKIP_INSTALL: "1"
+        run: ./scripts/build-app.sh
+
+      - name: Verify and archive development app
+        run: |
+          codesign --verify --deep --strict dist/ToastMonitor.app
+          lipo -verify_arch arm64 x86_64 dist/ToastMonitor.app/Contents/MacOS/ToastMonitor
+          ditto -c -k --sequesterRsrc --keepParent dist/ToastMonitor.app \
+            "dist/ToastMonitor-ci-${GITHUB_SHA}-universal.zip"
+
+      - name: Upload development app
+        uses: actions/upload-artifact@v7
+        with:
+          name: ToastMonitor-ci-${{ github.sha }}-universal
+          path: dist/ToastMonitor-ci-*-universal.zip
+          if-no-files-found: error
+          retention-days: 14
+
   release-bundle:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build-and-test

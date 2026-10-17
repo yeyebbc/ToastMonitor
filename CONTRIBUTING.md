@@ -15,6 +15,8 @@ swift test --filter DSHParserTests   # a single suite
 
 Builds in this repo are normally run with `swift build --disable-sandbox` on the host; CI uses a plain `swift build`.
 
+Successful pushes and manual CI runs on `main` upload a `ToastMonitor-ci-<commit>-universal` artifact after the checks pass. Download it from the run's Artifacts section and extract the enclosed app ZIP. These are ad-hoc-signed development builds (version `1.0`) for Apple Silicon and Intel, retained for 14 days.
+
 ## Visual regression
 
 CI runs `xcrun swift scripts/visual-regression.swift compare` on Xcode 27. Each scenario gets a fresh temporary `HOME` and `CFFIXED_USER_HOME` as well as its own database; `TZ` and `LANG` are fixed. Popover renders use `TM_VISUAL_REFERENCE_UNIX_TIME=1790769600` (2026-09-30 12:00 UTC) to stabilize date-dependent labels and the activity grid.
