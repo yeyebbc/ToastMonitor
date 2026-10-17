@@ -105,7 +105,7 @@ jobs:
       - name: Verify and archive development app
         run: |
           codesign --verify --deep --strict dist/ToastMonitor.app
-          lipo -verify_arch arm64 x86_64 dist/ToastMonitor.app/Contents/MacOS/ToastMonitor
+          lipo dist/ToastMonitor.app/Contents/MacOS/ToastMonitor -verify_arch arm64 x86_64
           ditto -c -k --sequesterRsrc --keepParent dist/ToastMonitor.app \
             "dist/ToastMonitor-ci-${GITHUB_SHA}-universal.zip"
 
