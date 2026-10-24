@@ -111,8 +111,10 @@ jobs:
       - name: Upload development app
         uses: actions/upload-artifact@v7
         with:
-          name: ToastMonitor-ci-${{ github.sha }}-universal
-          path: dist/ToastMonitor-ci-*-universal.zip
+          # Upload the ditto ZIP directly, preserving the app's permissions
+          # without wrapping it in another ZIP. The filename names the artifact.
+          path: dist/ToastMonitor-ci-${{ github.sha }}-universal.zip
+          archive: false
           if-no-files-found: error
           retention-days: 14
 
