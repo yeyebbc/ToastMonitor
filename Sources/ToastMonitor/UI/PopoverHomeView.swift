@@ -3,7 +3,7 @@ import Combine
 import AppKit
 import Charts
 
-/// yyyymmdd → Date（本地日历）。
+/// yyyymmdd -> Date (local calendar).
 private func dayFromKey(_ key: Int64) -> Date {
     var c = DateComponents()
     c.year = Int(key / 10_000)
@@ -12,8 +12,8 @@ private func dayFromKey(_ key: Int64) -> Date {
     return Calendar.current.date(from: c) ?? .distantPast
 }
 
-/// "Aug 5" 式短日期（hover 提示用）。固定英文 locale：系统为中文时
-/// DateFormatter 会输出 "8月5日"，Popover 全英文必须强制 en_US。
+/// "Aug 5" short date for hover readouts. Fixed en_US locale: the
+/// popover is English even when the system language is not.
 private let shortDayFormatter: DateFormatter = {
     let f = DateFormatter()
     f.locale = Locale(identifier: "en_US_POSIX")
@@ -29,18 +29,27 @@ private struct PopoverBodyHeightKey: PreferenceKey {
     }
 }
 
+/// Where the scrolled card stack sits in the viewport (0 at the top, negative
+/// as it scrolls up).
+private struct PopoverScrollOffsetKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
 /// Compact, single-purpose menu bar home. It answers three questions quickly:
 /// how much was used, where it came from, and whether a limit needs attention.
 struct PopoverHomeView: View {
     static let testPeriodNotification = Notification.Name("tmTestPopoverPeriod")
 
-    /// UI-1 决策：面板隐藏时跳过分钟 tick（不推进 now、不重载热力图）。
+    /// The minute tick is skipped while the panel is hidden.
     static func minuteTickAllowed(panelVisible: Bool) -> Bool {
         panelVisible
     }
 
-    /// UI-1 决策：可见性通知 → (新可见状态, 是否需要本次重载热力图)。
-    /// 仅在 隐藏→显示 转换时重载；其余转换（含保持显示）不重载。
+    /// Visibility notification -> (new visibility, reload heatmap now?).
+    /// Only a hidden -> visible transition reloads.
     static func visibilityTransition(visible: Bool, wasVisible: Bool) -> (visible: Bool, reload: Bool) {
         (visible, visible && !wasVisible)
     }
@@ -92,15 +101,17 @@ struct PopoverHomeView: View {
     @AppStorage(CodexPlanName.customNameKey) private var codexCustomName = ""
     /// Activity card shows one history view at a time: heatmap or trend.
     @AppStorage("popoverHistoryMode") private var historyMode = HistoryMode.heatmap
-    /// Cards the user hid with the eye button (comma-separated keys).
+    /// Cards hidden in Settings › Appearance (comma-separated keys).
     @AppStorage("popoverHiddenSections") private var hiddenSectionsRaw = ""
-    /// 年度每日用量（Popover 自持：AppState 只在 dashboard 可见时填 heatmap）。
+    /// Daily usage for a year. The popover loads its own: AppState fills its heatmap only while the dashboard is visible.
     @State private var heatmapData: [Int64: Int64] = [:]
     @State private var detectedTools: [ToolKind] = []
-    /// 面板是否可见。PopoverHomeView 常驻（面板不销毁视图），隐藏时分钟
-    /// tick 与热力图重载都必须停，否则每 60s 跑一次 371 天聚合（UI-1）。
+    /// Whether the panel is visible. The view stays alive while hidden, so the
+    /// minute tick and heatmap reload must stop or a 371-day aggregation runs every 60s.
     @State private var panelVisible = false
     @State private var bodyContentHeight: CGFloat = 0
+    /// True once the scrolled content reaches the bottom of the viewport.
+    @State private var scrolledToEnd = true
     private let minuteTicker = Timer.publish(every: 60, on: .main, in: .common).autoconnect()
 
     @MainActor init(deepseek: DeepSeekBillingClient? = nil) {
@@ -160,57 +171,79 @@ struct PopoverHomeView: View {
         }
     }
 
+    private static let scrollTopID = "popover-scroll-top"
+
     var body: some View {
         VStack(spacing: 0) {
-            // Keep the period selector outside the scroll view. Long 7-day
-            // and 30-day pages may need to scroll after the panel reaches the
-            // screen-height limit, but the selector must always remain visible.
-            periodControl
-                .padding(.horizontal, TMLayout.popoverCardInset)
-                .padding(.top, 4)
-                .padding(.bottom, 12)
-                .fixedSize(horizontal: false, vertical: true)
-                .reportPopoverHeight(.pinned)
-
             GeometryReader { viewport in
+                // Cards fade out at the bottom edge while more content is below
+                // the viewport. A mask, not a colored overlay: the panel is
+                // translucent, so any fixed color would show as a band.
+                let overflows = bodyContentHeight > viewport.size.height + 1
+                let fading = overflows && !scrolledToEnd
                 ZStack(alignment: .bottom) {
-                    ScrollView(.vertical, showsIndicators: false) {
-                        // The footer remains fixed; a subtle bottom fade signals
-                        // that the card stack can continue below the viewport.
-                        VStack(alignment: .leading, spacing: 10) {
-                            hero
-                                .padding(.horizontal, 2)
-                                .padding(.bottom, 4)
-                            if !isSectionHidden("sources") {
-                                PopoverCard(title: "Sources") { sourceBar }
+                    ScrollViewReader { scroller in
+                        ScrollView(.vertical, showsIndicators: false) {
+                            VStack(alignment: .leading, spacing: 10) {
+                                // Everything the period selector changes lives in
+                                // this one card; Quota and Balance below are
+                                // current state and sit outside it.
+                                // The selector heads the card instead of a title: it
+                                // names what the card shows and has the full width.
+                                PopoverCard(title: "") {
+                                    VStack(alignment: .leading, spacing: 14) {
+                                        periodControl
+                                        hero
+                                        if !isSectionHidden("sources") { sourceBar }
+                                    }
+                                }
+                                if !isSectionHidden("quota") { quotaSection }
+                                if !isSectionHidden("balance") { balanceSection }
+                                if !isSectionHidden("activity") {
+                                    PopoverCard(title: "Activity",
+                                                accessory: { historyAccessory },
+                                                trailing: { historyPicker }) { historyBlock }
+                                }
                             }
-                            if !isSectionHidden("quota") { quotaSection }
-                            if !isSectionHidden("balance") { balanceSection }
-                            if !isSectionHidden("activity") {
-                                PopoverCard(title: "Activity",
-                                            accessory: { historyAccessory },
-                                            trailing: { historyPicker }) { historyBlock }
+                            .padding(.horizontal, TMLayout.popoverCardInset)
+                            .padding(.top, 4)
+                            .padding(.bottom, 12)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .background(GeometryReader { content in
+                                Color.clear.preference(key: PopoverBodyHeightKey.self,
+                                                       value: content.size.height)
+                            })
+                            .reportPopoverHeight(.body)
+                            .id(Self.scrollTopID)
+                            .background(GeometryReader { content in
+                                Color.clear.preference(key: PopoverScrollOffsetKey.self,
+                                                       value: content.frame(in: .named("popoverScroll")).minY)
+                            })
+                        }
+                        .coordinateSpace(name: "popoverScroll")
+                        .mask {
+                            VStack(spacing: 0) {
+                                Rectangle()
+                                if fading {
+                                    LinearGradient(colors: [.black, .clear],
+                                                   startPoint: .top, endPoint: .bottom)
+                                        .frame(height: 22)
+                                }
                             }
                         }
-                        .padding(.horizontal, TMLayout.popoverCardInset)
-                        .padding(.bottom, 12)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .background(GeometryReader { content in
-                            Color.clear.preference(key: PopoverBodyHeightKey.self,
-                                                   value: content.size.height)
-                        })
-                        .reportPopoverHeight(.body)
-                    }
-                    if bodyContentHeight > viewport.size.height + 1 {
-                        LinearGradient(colors: [.clear, TMDesign.canvas.opacity(0.9)],
-                                       startPoint: .top, endPoint: .bottom)
-                            .frame(height: 18)
-                            .allowsHitTesting(false)
+                        // A new period starts at the top. Scrolling instead of
+                        // rebuilding the stack (`.id(period)`) keeps the native
+                        // selector alive and the panel from collapsing and
+                        // re-growing on every switch.
+                        .onChange(of: period) { _ in scroller.scrollTo(Self.scrollTopID, anchor: .top) }
                     }
                 }
                 .onPreferenceChange(PopoverBodyHeightKey.self) { bodyContentHeight = $0 }
+                .onPreferenceChange(PopoverScrollOffsetKey.self) { offset in
+                    let atEnd = bodyContentHeight + offset <= viewport.size.height + 1
+                    if atEnd != scrolledToEnd { scrolledToEnd = atEnd }
+                }
             }
-            .id(period)
             .frame(minHeight: 0, maxHeight: .infinity)
             .layoutPriority(1)
         }
@@ -228,16 +261,16 @@ struct PopoverHomeView: View {
             deepseek.select(period.slot, configuration: periodSettings.configuration)
         }
         .onReceive(minuteTicker) { tick in
-            // UI-1: 面板隐藏时跳过整轮 tick——不推进 now、不重载热力图。
-            // 显示时再由可见性通知补一次加载，所以数据不会等下一个 60s。
+            // Hidden panel: skip the whole tick. Becoming visible reloads at once,
+            // so the data never waits for the next minute.
             guard Self.minuteTickAllowed(panelVisible: panelVisible) else { return }
             now = tick
             deepseek.select(period.slot, configuration: periodSettings.configuration, now: tick)
             reloadHeatmap()
         }
         .onReceive(NotificationCenter.default.publisher(for: TMNotifications.popoverVisibility)) { note in
-            // UI-1: 面板常驻，可见性由通知驱动。仅在 隐藏→显示 转换时
-            // 立即重载热力图（初始 onAppear 已负责首次加载）。
+            // Only a hidden -> visible transition reloads the heatmap; onAppear
+            // handles the first load.
             let visible = (note.object as? Bool) ?? false
             let transition = Self.visibilityTransition(visible: visible, wasVisible: panelVisible)
             panelVisible = transition.visible
@@ -273,25 +306,26 @@ struct PopoverHomeView: View {
                     .minimumScaleFactor(0.6)
                     .tmNumericTextTransition(value: Double(tokens))
                     // Both the token count and the display format drive the
-                    // transition, so toggling 缩写/完整 animates the same way
+                    // transition, so toggling compact/full numbers animates the same way
                     // as a live token update.
                     .animation(.easeOut(duration: 0.35), value: HeroValue(tokens: tokens, full: fullTokens))
                     .accessibilityLabel("\(periodSettings.configuration.label(for: period.slot)) token usage")
                     .accessibilityValue(Text("\(Format.full(tokens)) tokens"))
-                    .help(Format.full(tokens))
                 Text("tokens")
                     .font(TMType.regular(13))
                     .foregroundStyle(.tertiary)
             }
             HStack(spacing: 16) {
                 HeroChip(label: "Spent", value: combinedSpentText,
-                         warning: deepseekSpendPending
-                             ? "DeepSeek: \(deepseek.spendText). \(deepseek.state.spendError ?? "")"
+                         problem: deepseekSpendPending
+                             ? RowProblem(title: "DeepSeek spending not included yet",
+                                          detail: "Spent leaves out DeepSeek's account billing for this "
+                                              + "period until it loads"
+                                              + (deepseek.state.spendError.map { " (\($0))" } ?? "")
+                                              + ". ToastMonitor tries again on its own.")
                              : nil)
-                    .help(spentHelp)
                 HeroChip(label: "Value",
                          value: estimatedShown > 0 ? Format.money(estimatedShown) : "—")
-                    .help("What these model calls would cost at official API list prices. This is not a billed amount.")
             }
         }
     }
@@ -302,14 +336,6 @@ struct PopoverHomeView: View {
         deepseek.state.kind == .platform
             && (includedDeepSeekSpend == nil
                 || deepseek.stale(deepseek.state.spendUpdated, error: deepseek.state.spendError, now: now))
-    }
-
-    private var spentHelp: String {
-        let rate = DeepSeekBilling.validExchangeRate(cnyPerUSD) ? cnyPerUSD : DeepSeekBilling.defaultCNYPerUSD
-        let base = "Billed turn costs, OpenRouter usage, subscription amortization, and available DeepSeek account-wide billing. Matching direct DeepSeek local costs are replaced by account billing. CNY converted at the configured accounting rate: 1 USD = \(rate) CNY."
-        return period == .all
-            ? base + " OpenRouter only exposes its recent monthly window, not full account history."
-            : base
     }
 
     private var includedDeepSeekSpend: DeepSeekBilling.Spend? {
@@ -323,27 +349,30 @@ struct PopoverHomeView: View {
 
     @ViewBuilder
     private var periodControl: some View {
-        let labels = Period.allCases.map { periodSettings.configuration.label(for: $0.slot) }
-        if #available(macOS 26.0, *) {
-            NativePeriodSelector(selection: $period, labels: labels)
-                // PopoverRootView intentionally makes ordinary controls
-                // small. This top-level range selector is the exception: the
-                // native macOS 26/27 metric is a 36 pt extra-large capsule.
-                .environment(\.controlSize, .extraLarge)
-                .accessibilityLabel("Period")
-        } else {
-            NativePeriodSelector(selection: $period, labels: labels)
-                .environment(\.controlSize, .large)
-                .accessibilityLabel("Period")
+        let selector = NativePeriodSelector(
+            selection: $period,
+            labels: Period.allCases.map { periodSettings.configuration.label(for: $0.slot) })
+        // PopoverRootView makes ordinary controls small; without its own
+        // controlSize the selector is created small and only corrects itself
+        // after a rebuild (switching periods), so its height jumped.
+        Group {
+            if #available(macOS 26.0, *) {
+                selector.environment(\.controlSize, .extraLarge)
+            } else {
+                selector.environment(\.controlSize, .large)
+            }
         }
+        .frame(maxWidth: .infinity)
+        .fixedSize(horizontal: false, vertical: true)
+        .accessibilityLabel("Period")
     }
 
-    /// 实际支出 = turns 实际 + OpenRouter 今日实际 + 全部订阅摊销。
+    /// Actual spend = billed turns + OpenRouter + amortized subscriptions.
     private var actualShown: Double {
         cost.actual + periodOrUsage + subsAmortized
     }
 
-    /// API 价值 = 全部工具（含 hermes）turns 按模型官方单价重估。
+    /// API value = every tool's turns (Hermes included) at list prices.
     private var estimatedShown: Double {
         switch period {
         case .today: return app.apiValueToday
@@ -358,7 +387,7 @@ struct PopoverHomeView: View {
         case .today: orClient.state.usageDaily
         case .week: orClient.state.usageWeekly
         case .month: orClient.state.usageMonthly
-        // OpenRouter 只提供月窗口；全部时按最近月近似。
+        // OpenRouter only reports a monthly window; All uses the latest month.
         case .all: orClient.state.usageMonthly
         }
     }
@@ -369,20 +398,20 @@ struct PopoverHomeView: View {
         case .today: days = 1
         case .week: days = 7
         case .month: days = 30
-        // 全部：10 年窗口覆盖全部订阅期（含已结束的），全额计入。
+        // All: a 10-year window covers every subscription, ended ones included.
         case .all: days = 3650
         }
         return SubscriptionMath.amortized(days: days, subscriptions: app.subscriptions)
     }
 
-    /// 来源分段条 + 每来源一行（行尾直接显示占比，无隐式交互）。
+    /// Source share bar plus one row per source.
     private var sourceBar: some View {
         let rows = sortedRows
         let total = rows.reduce(Int64(0)) {
             $0 + (ToolKind(rawValue: $1.tool)?.totalTokens($1) ?? ($1.input + $1.output))
         }
-        // 从未配置过 source（全部时间都没有任何数据）才是"未开始"，光是
-        // 当前周期没有数据不代表没配置——否则每天开局都会误判成 Get Started。
+        // "Never configured" means no data at all, ever. An empty current
+        // period must not show Get Started at the start of every day.
         let neverConfigured = rows.isEmpty && app.byToolAll.isEmpty
         return VStack(alignment: .leading, spacing: 7) {
             if neverConfigured {
@@ -407,24 +436,10 @@ struct PopoverHomeView: View {
                     .font(TMType.regular(TMType.caption))
                     .foregroundStyle(TMDesign.quiet)
             } else {
-                GeometryReader { geo in
-                    ZStack(alignment: .leading) {
-                        // 轨道：系统低层级填充（不发光）
-                        Capsule().fill(Color.primary.opacity(0.06))
-                        HStack(spacing: 0) {
-                            ForEach(rows, id: \.tool) { row in
-                                let value = ToolKind(rawValue: row.tool)?.totalTokens(row) ?? (row.input + row.output)
-                                let ratio = total > 0 ? CGFloat(value) / CGFloat(total) : 0
-                                Rectangle()
-                                    .fill(Self.sourceColor(row.tool))
-                                    .frame(width: geo.size.width * ratio)
-                            }
-                        }
-                        .clipShape(Capsule())
-                    }
-                }
-                .frame(height: 6)
-                .accessibilityHidden(true)
+                SourceBar(segments: rows.map { row in
+                    (Double(ToolKind(rawValue: row.tool)?.totalTokens(row) ?? (row.input + row.output)),
+                     Self.sourceColor(row.tool))
+                })
 
                 ForEach(rows, id: \.tool) { row in
                     HStack(spacing: 7) {
@@ -442,7 +457,6 @@ struct PopoverHomeView: View {
                             .font(TMType.number(TMType.body))
                             .foregroundStyle(.secondary)
                     }
-                    .help(row.tool == ClaudeNonLocalEstimator.estimateToolLabel ? Self.elsewhereHelp : "")
                     .accessibilityElement(children: .combine)
                     .accessibilityLabel(ToolKind(rawValue: row.tool)?.displayName ?? row.tool)
                     .accessibilityValue(Text("\(Format.full(ToolKind(rawValue: row.tool)?.totalTokens(row) ?? (row.input + row.output))) tokens, \(percentText(row, total: total)) of total"))
@@ -457,14 +471,6 @@ struct PopoverHomeView: View {
         if tool == ClaudeNonLocalEstimator.estimateToolLabel { return ToolKind.claude.color.opacity(0.45) }
         return ToolKind(rawValue: tool)?.color ?? TMDesign.accent
     }
-
-    private static let elsewhereHelp = """
-    Estimate. Claude usage that leaves no transcript on this Mac — Cowork, claude.ai chat, \
-    Claude Code on another machine — can't be counted, only seen in the shared quota. Quota \
-    that rose while this Mac recorded no Claude Code activity is converted to tokens at the \
-    rate your local Claude Code usage consumes quota. Quota is sampled only while this panel \
-    or the dashboard is open, so the real figure is likely higher.
-    """
 
     private func loadDetectedTools() {
         DispatchQueue.global(qos: .utility).async {
@@ -495,7 +501,7 @@ struct PopoverHomeView: View {
         }
     }
 
-    // MARK: - 额度状态（实时账户快照，与所选周期无关）
+    // MARK: - Quota (live account state, independent of the period)
 
     /// Quota/balance is a live account snapshot — it only changes as time
     /// passes, never with the selected period. Showing it inside the period
@@ -518,11 +524,21 @@ struct PopoverHomeView: View {
         let visible = sources.filter { $0.connected && !(quotaRowHidden[$0.key] ?? false) }
         let unconnected = sources.filter { !$0.connected && !(quotaRowHidden[$0.key] ?? false) }
         if !visible.isEmpty || !unconnected.isEmpty {
+            // Balances with nothing to act on share one line; one that is
+            // running out, empty or failing gets its own full row.
+            let calm = group == .balance
+                ? visible.compactMap { src in calmBalance(src.key).map { (key: src.key, name: src.name, value: $0) } }
+                : []
+            let rows = visible.map(\.key).filter { key in !calm.contains { $0.key == key } }
             PopoverCard(title: title) {
                 VStack(alignment: .leading, spacing: 0) {
-                    ForEach(Array(visible.map(\.key).enumerated()), id: \.element) { index, key in
+                    ForEach(Array(rows.enumerated()), id: \.element) { index, key in
                         if index > 0 { rowDivider }
                         quotaRow(key)
+                    }
+                    if !calm.isEmpty {
+                        if !rows.isEmpty { rowDivider }
+                        BalanceLine(items: calm.map { ($0.name, $0.value) })
                     }
                     if !unconnected.isEmpty {
                         if !visible.isEmpty { rowDivider }
@@ -591,17 +607,15 @@ struct PopoverHomeView: View {
         }
     }
 
-    // MARK: - 活动与趋势（历史维度，与周期选择无关）
+    // MARK: - Activity and trend (history, independent of the period)
 
-    /// 历史板块：热力图与趋势合并为一张卡片，标题行右侧的小分段切换，
-    /// 选择持久化。两种视图占同一高度，切换时面板不跳。
+    /// Heatmap and trend share one card with a small switch in its title
+    /// row (persisted). Both views have one height, so switching never jumps.
     private var historyBlock: some View {
         Group {
             switch historyMode {
             case .heatmap:
-                PopoverHeatmap(weeks: activityWeeks,
-                               heatmap: heatmapData,
-                               maxTokens: visibleHeatmapPeak)
+                PopoverHeatmap(weeks: activityWeeks, heatmap: heatmapData)
             case .trend:
                 TrendChartView(series: trendSeries)
             }
@@ -614,25 +628,19 @@ struct PopoverHomeView: View {
              ? "\(activeDays) active days"
              : "Peak \(Format.compact(trendPeak))")
             .font(TMType.number(TMType.caption))
-            .foregroundStyle(.secondary)
+            .foregroundStyle(TMDesign.quiet)
     }
 
+    /// Same native capsule as the period selector, so the two switches in
+    /// the panel look alike instead of one in accent blue.
     private var historyPicker: some View {
-        Picker("History view", selection: $historyMode) {
-            Image(systemName: "square.grid.3x3.fill")
-                .help("Heatmap")
-                .tag(HistoryMode.heatmap)
-            Image(systemName: "chart.xyaxis.line")
-                .help("Trend")
-                .tag(HistoryMode.trend)
-        }
-        .pickerStyle(.segmented)
-        .labelsHidden()
-        .controlSize(.small)
-        .fixedSize()
+        NativeHistorySelector(selection: $historyMode)
+            .environment(\.controlSize, .small)
+            .fixedSize()
+            .accessibilityLabel("History view")
     }
 
-    // MARK: - 板块隐藏
+    // MARK: - Hidden sections
 
     private var hiddenSections: [String] {
         hiddenSectionsRaw.split(separator: ",").map(String.init)
@@ -640,8 +648,8 @@ struct PopoverHomeView: View {
 
     private func isSectionHidden(_ key: String) -> Bool { hiddenSections.contains(key) }
 
-    /// UserDefaults 持久化的上次热力图数据：冷启动先显示旧曲线，
-    /// 异步刷新后再更新，避免 Activity/Trend 区块空白等待。
+    /// Last heatmap data, persisted so a cold start draws it immediately
+    /// instead of an empty Activity/Trend card.
     private static let heatmapCacheKey = "popoverHeatmapCache"
 
     private func cachedHeatmap() -> [Int64: Int64]? {
@@ -662,7 +670,7 @@ struct PopoverHomeView: View {
     }
 
     private func reloadHeatmap() {
-        // 打开时立即用缓存数据渲染，再异步刷新。
+        // Draw from the cache at once, then refresh asynchronously.
         if heatmapData.isEmpty, let cached = cachedHeatmap() {
             heatmapData = cached
         }
@@ -682,13 +690,7 @@ struct PopoverHomeView: View {
         visibleHeatmapKeys.filter { (heatmapData[$0] ?? 0) > 0 }.count
     }
 
-    /// Color scale follows the visible window, so an old spike outside the
-    /// grid no longer washes every visible cell out.
-    private var visibleHeatmapPeak: Int64 {
-        visibleHeatmapKeys.compactMap { heatmapData[$0] }.max() ?? 0
-    }
-
-    /// 最近 60 天（含今天）按日排序的用量序列。
+    /// Daily usage for the last 60 days (today included), oldest first.
     private var trendSeries: [(key: Int64, tokens: Int64)] {
         heatmapData.sorted { $0.key < $1.key }
             .suffix(60)
@@ -699,7 +701,7 @@ struct PopoverHomeView: View {
         trendSeries.map(\.tokens).max() ?? 0
     }
 
-    /// 近 24 周网格：key 与 heatmapData 的 yyyymmdd（本地日）对齐。
+    /// Last 24 weeks; keys match heatmapData's local yyyymmdd days.
     private var activityWeeks: [[Int64?]] {
         Self.buildHeatmapWeeks(now: now, configuration: periodSettings.configuration)
     }
@@ -769,16 +771,17 @@ struct PopoverHomeView: View {
         // as Claude's 5h line — a plan with unlimited/no weekly cap simply
         // never sets weeklyPct, so this stays hidden rather than showing 0%.
         let windows = [
-            window("Rolling", state.rollingPct, reset: state.rollingReset.map { state.lastSync + $0 }),
-            window("Weekly", state.weeklyPct, reset: state.weeklyReset.map { state.lastSync + $0 }),
-            window("Monthly", state.monthlyPct, reset: state.monthlyReset.map { state.lastSync + $0 }),
+            window("Rolling", state.rollingPct, reset: state.rollingReset.map { state.lastSync + $0 }, duration: 5 * 3600),
+            window("Weekly", state.weeklyPct, reset: state.weeklyReset.map { state.lastSync + $0 }, duration: 7 * 86400),
+            window("Monthly", state.monthlyPct, reset: state.monthlyReset.map { state.lastSync + $0 }, duration: 30 * 86400),
         ].compactMap { $0 }
         return statusRow(name: "OpenCode Go", status: status, tint: ToolKind.opencode.color,
                          statusColor: .primary,
                          critical: remaining.map { $0 < 20 } ?? false,
                          resetSuffix: resetSuffix,
                          staleBadge: staleBadge,
-                         windows: windows)
+                         windows: windows,
+                         problem: state.error.map { RowProblem.from(service: "OpenCode Go", error: $0) })
     }
 
     /// Claude subscription quota, from the same OAuth usage endpoint Claude
@@ -815,7 +818,7 @@ struct PopoverHomeView: View {
         if !claudeQuota.enabled {
             // Opt-in, off by default (see ClaudeQuotaClient) — distinct from
             // "Not configured" so it reads as a choice, not a missing login.
-            status = "Off — enable in Dashboard"
+            status = "Off — enable in Settings"
         } else if let remaining, let weekly {
             status = "\(remaining)% weekly left"
             resetSuffix = resetText(weekly.resetAt)
@@ -837,18 +840,9 @@ struct PopoverHomeView: View {
                          subtitle: claudeQuota.enabled ? claudeSubtitle(state) : nil,
                          subtitleCritical: claudeQuota.enabled && state.hasCriticalSecondaryWindow,
                          staleBadge: staleBadge,
-                         windows: claudeQuota.enabled ? claudeWindows(state) : [])
-            .help(claudeErrorHelp(state))
-    }
-
-    /// What the ⚠ after the name means: the last error, and when the next
-    /// attempt is allowed.
-    private func claudeErrorHelp(_ state: ClaudeQuotaClient.State) -> String {
-        guard let error = state.error else { return "" }
-        let wait = Int64(state.retryAt - now.timeIntervalSince1970)
-        guard wait > 0 else { return error }
-        let sentence = error.hasSuffix(".") ? String(error.dropLast()) : error
-        return "\(sentence). Retrying in \(Format.remaining(wait))."
+                         windows: claudeQuota.enabled ? claudeWindows(state) : [],
+                         problem: claudeQuota.enabled
+                             ? state.error.map { RowProblem.from(service: claudeRowName, error: $0) } : nil)
     }
 
     /// The 5h window (and, rarely, a weekly-Opus one) rendered as a compact
@@ -859,19 +853,27 @@ struct PopoverHomeView: View {
     /// plans, a weekly Opus one) — each gets its own usage bar.
     private func claudeWindows(_ state: ClaudeQuotaClient.State) -> [QuotaWindow] {
         [
-            state.fiveHour.flatMap { window("5h", Double($0.usedPercent), reset: $0.resetAt) },
-            state.sevenDay.flatMap { window("Weekly", Double($0.usedPercent), reset: $0.resetAt) },
-            state.sevenDayOpus.flatMap { window("Opus", Double($0.usedPercent), reset: $0.resetAt) },
+            state.fiveHour.flatMap { window("5h", Double($0.usedPercent), reset: $0.resetAt, duration: 5 * 3600) },
+            state.sevenDay.flatMap { window("Weekly", Double($0.usedPercent), reset: $0.resetAt, duration: 7 * 86400) },
+            state.sevenDayOpus.flatMap { window("Opus", Double($0.usedPercent), reset: $0.resetAt, duration: 7 * 86400) },
         ].compactMap { $0 }
     }
 
     /// A usage window line: `usedPercent` is how much is USED (0…100), so the
     /// bar grows rightward as the quota is consumed.
-    private func window(_ label: String, _ usedPercent: Double?, reset: Int64?) -> QuotaWindow? {
+    private func window(_ label: String, _ usedPercent: Double?, reset: Int64?,
+                         duration: Int64? = nil) -> QuotaWindow? {
         guard let usedPercent, usedPercent.isFinite else { return nil }
         let nowSeconds = Int64(now.timeIntervalSince1970)
         let resetIn = reset.flatMap { $0 > nowSeconds ? Format.remaining($0 - nowSeconds) : nil }
-        return QuotaWindow(label: label, usedPercent: min(max(usedPercent, 0), 100), resetIn: resetIn)
+        // Share of the window already elapsed, from the reset time and the
+        // window length; nil when either is unknown.
+        let elapsed: Double? = {
+            guard let reset, let duration, duration > 0, reset > nowSeconds else { return nil }
+            return min(max(1 - Double(reset - nowSeconds) / Double(duration), 0), 1)
+        }()
+        return QuotaWindow(label: label, usedPercent: min(max(usedPercent, 0), 100),
+                           resetIn: resetIn, elapsed: elapsed)
     }
 
     private var codexWindowShortLabel: String {
@@ -892,10 +894,9 @@ struct PopoverHomeView: View {
     /// otherwise — the credentials blob does not always carry a plan.
     private var claudeRowName: String {
         let plan = claudeQuota.state.planType?.lowercased() ?? ""
-        let suffix = claudeQuota.state.error == nil ? "" : " ⚠"
-        if plan.contains("max") { return "Claude Max" + suffix }
-        if plan.contains("pro") { return "Claude Pro" + suffix }
-        return "Claude" + suffix
+        if plan.contains("max") { return "Claude Max" }
+        if plan.contains("pro") { return "Claude Pro" }
+        return "Claude"
     }
 
     /// Window label derives from limit_window_seconds: 604800 = weekly (Plus today).
@@ -915,7 +916,7 @@ struct PopoverHomeView: View {
         let sub = app.subscriptions.first { $0.plan == "openai" || $0.plan == "codex" }
         let stale = state.lastSync > 0
             && now.timeIntervalSince1970 - TimeInterval(state.lastSync) > 120
-        // 刷新期间保留上次结果：只有从未同步过才显示 Loading。
+        // Keep the last result while refreshing; Loading only before the first sync.
         var status = sub == nil ? "Not configured"
                     : (state.lastSync <= 0 ? "Loading" : "Idle")
         var resetSuffix: String?
@@ -940,7 +941,9 @@ struct PopoverHomeView: View {
                          resetSuffix: resetSuffix,
                          staleBadge: staleBadge,
                          windows: [window(codexWindowShortLabel, state.primaryPct.map(Double.init),
-                                          reset: state.resetAt)].compactMap { $0 })
+                                          reset: state.resetAt,
+                                          duration: state.windowSeconds.map(Int64.init))].compactMap { $0 },
+                         problem: state.error.map { RowProblem.from(service: name, error: $0) })
     }
 
     /// Command Code GOAT quota (experimental private billing API).
@@ -948,7 +951,7 @@ struct PopoverHomeView: View {
     /// Stale interstitial — and replaces it when fresh data lands.
     private var commandCodeStatusRow: some View {
         let state = ccQuota.state
-        let name = "Command Code GOAT" + (state.error == nil ? "" : " ⚠")
+        let name = "Command Code GOAT"
         let stale = state.lastSync > 0
             && now.timeIntervalSince1970 - TimeInterval(state.lastSync) > 120
         var status = state.configured ? "Loading" : "Not configured"
@@ -983,15 +986,21 @@ struct PopoverHomeView: View {
                          resetSuffix: resetSuffix,
                          staleBadge: staleBadge,
                          windows: [window("Monthly", state.monthlyUsedPercent,
-                                          reset: state.billingPeriodEnd.map { Int64($0.timeIntervalSince1970) })].compactMap { $0 })
+                                          reset: state.billingPeriodEnd.map { Int64($0.timeIntervalSince1970) },
+                                          duration: 30 * 86400)].compactMap { $0 },
+                         problem: state.error.map { RowProblem.from(service: name, error: $0) })
     }
 
-    /// Grok's one weekly pool (Chat, Imagine, Build, Grok Bot), named
-    /// "Grok · <plan>" when the plan is known. The subtitle splits the used
+    /// Grok's one weekly pool (Chat, Imagine, Build, Grok Bot), named after
+    /// the linked subscription, else "Grok · <plan>" from the API. The subtitle splits the used
     /// share by product when the API reports it.
     private var grokStatusRow: some View {
         let state = grokQuota.state
-        let name = "Grok" + (state.planName.map { " · \($0)" } ?? "") + (state.error == nil ? "" : " ⚠")
+        // A recorded subscription is named in full ("X Subscription
+        // Premium"); the API only gives a tier, so that one gets "Grok · ".
+        let recorded = GrokQuotaClient.plan(subscriptions: app.subscriptions, apiPlan: nil, now: now)
+        let plan = recorded ?? state.planName.map { "Grok · \($0)" } ?? "Grok"
+        let name = plan
         let stale = state.lastSync > 0
             && now.timeIntervalSince1970 - TimeInterval(state.lastSync) > 120
         var status = state.configured ? "Loading" : "Not configured"
@@ -1016,7 +1025,8 @@ struct PopoverHomeView: View {
                          resetSuffix: resetSuffix,
                          subtitle: breakdown.isEmpty ? nil : breakdown,
                          staleBadge: staleBadge,
-                         windows: [window("Weekly", state.usedPercent, reset: state.resetAt)].compactMap { $0 })
+                         windows: [window("Weekly", state.usedPercent, reset: state.resetAt, duration: 7 * 86400)].compactMap { $0 },
+                         problem: state.error.map { RowProblem.from(service: name, error: $0) })
     }
 
     private var routerStatusRow: some View {
@@ -1026,6 +1036,7 @@ struct PopoverHomeView: View {
         var status: String
         var staleBadge: String?
         var resetSuffix: String?
+        var runway: String?
         if !orClient.hasKey {
             status = "Not configured"
         } else if state.authInvalid {
@@ -1033,9 +1044,12 @@ struct PopoverHomeView: View {
             // account) was deleted on openrouter.ai. A bare "Error" gave no
             // hint that the fix is re-adding a key, not waiting it out.
             status = "Key rejected"
-            resetSuffix = "Replace key in Settings"
         } else if let balance = state.accountBalance {
             status = Format.money(balance)
+            let since = Int64(now.timeIntervalSince1970) - BalanceRunway.lookback
+            runway = BalanceRunway.lowText(
+                balance: balance,
+                dailySpend: BalanceRunway.dailySpend(cumulative: Database.shared.orCreditUsage(since: since)))
             if stale {
                 let age = now.timeIntervalSince1970 - TimeInterval(state.lastOK)
                 staleBadge = "\(Format.remaining(Int64(age))) ago"
@@ -1049,10 +1063,22 @@ struct PopoverHomeView: View {
         }
         return statusRow(name: "OpenRouter", status: status,
                          statusColor: orClient.hasKey ? .primary : TMDesign.quiet,
-                         critical: state.authInvalid && orClient.hasKey,
+                         critical: runway != nil || state.accountBalance.map { $0 <= 0 } == true,
                          resetSuffix: resetSuffix,
-                         staleBadge: staleBadge)
-            .help(state.error ?? "")
+                         staleBadge: staleBadge,
+                         nameDetail: runway,
+                         problem: routerProblem(state))
+    }
+
+    private func routerProblem(_ state: OpenRouterClient.State) -> RowProblem? {
+        guard orClient.hasKey else { return nil }
+        if state.authInvalid {
+            return RowProblem(title: "OpenRouter rejected the key",
+                              detail: "The key, or the account it belongs to, may have been deleted on "
+                                  + "openrouter.ai. Add a new key in Settings › Accounts.",
+                              opensSettings: true)
+        }
+        return state.error.map { RowProblem.from(service: "OpenRouter", error: $0) }
     }
 
     private var deepseekStatusRow: some View {
@@ -1066,10 +1092,69 @@ struct PopoverHomeView: View {
         let balance = shown.isEmpty ? nil : shown.map { $0.total.symbolFormatted }.joined(separator: "  ·  ")
         return statusRow(name: "DeepSeek", status: balance ?? deepseek.balanceText,
                          statusColor: state.kind == nil ? TMDesign.quiet : .primary,
-                         critical: state.balance?.available == false,
+                         critical: state.balance?.available == false || deepseekLow(shown) != nil,
                          subtitle: state.balance?.available == false ? "Unavailable for API calls" : nil,
-                         staleBadge: stale ? "Stale" : nil)
-            .help("Account balance: \(deepseek.balanceText). \(state.balanceError ?? "")")
+                         staleBadge: stale ? "Stale" : nil,
+                         nameDetail: deepseekLow(shown),
+                         problem: deepseekProblem(state))
+    }
+
+    private func deepseekProblem(_ state: DeepSeekBillingClient.State) -> RowProblem? {
+        if state.expired {
+            return RowProblem(title: "DeepSeek sign-in expired",
+                              detail: "Sign in to DeepSeek again in Settings › Accounts.",
+                              opensSettings: true)
+        }
+        return state.balanceError.map { RowProblem.from(service: "DeepSeek", error: $0) }
+    }
+
+    /// "~3.2d left" when the DeepSeek balance is running out. Platform
+    /// logins report this month's spend directly; API-key logins fall back
+    /// to how the recorded balance has been falling. Several funded wallets
+    /// have no single answer, so they say nothing.
+    private func deepseekLow(_ shown: [DeepSeekBilling.Wallet]) -> String? {
+        guard shown.count == 1 else { return nil }
+        let wallet = shown[0].total
+        let balance = NSDecimalNumber(decimal: wallet.amount).doubleValue
+        let nowSeconds = Int64(now.timeIntervalSince1970)
+        var daily: Double?
+        if let spend = deepseek.spend(for: .month, configuration: periodSettings.configuration, now: now),
+           nowSeconds - spend.window.start >= BalanceRunway.minCoverage {
+            let spent = spend.amounts.first { $0.currency == wallet.currency }
+                .map { NSDecimalNumber(decimal: $0.amount).doubleValue } ?? 0
+            daily = spent / Double(nowSeconds - spend.window.start) * 86_400
+        } else {
+            daily = BalanceRunway.dailySpend(balances: Database.shared.deepSeekBalances(
+                currency: wallet.currency, since: nowSeconds - BalanceRunway.lookback))
+        }
+        return BalanceRunway.lowText(balance: balance, dailySpend: daily)
+    }
+
+    /// The balance text when the account needs nothing from the user —
+    /// fresh, positive, not running out, no error. Nil sends it to a full row.
+    private func calmBalance(_ key: String) -> String? {
+        switch key {
+        case "router":
+            let state = orClient.state
+            guard orClient.hasKey, !state.authInvalid, state.error == nil,
+                  let balance = state.accountBalance, balance > 0,
+                  now.timeIntervalSince1970 - TimeInterval(state.lastOK) <= 120 else { return nil }
+            let since = Int64(now.timeIntervalSince1970) - BalanceRunway.lookback
+            let low = BalanceRunway.lowText(
+                balance: balance,
+                dailySpend: BalanceRunway.dailySpend(cumulative: Database.shared.orCreditUsage(since: since)))
+            return low == nil ? Format.money(balance) : nil
+        case "deepseek":
+            let state = deepseek.state
+            guard state.kind != nil, !state.expired, state.balanceError == nil,
+                  let wallets = state.balance?.wallets, state.balance?.available != false,
+                  !deepseek.stale(state.balanceUpdated, error: state.balanceError, now: now) else { return nil }
+            let funded = wallets.filter { $0.total.amount > 0 }
+            guard !funded.isEmpty, deepseekLow(funded) == nil else { return nil }
+            return funded.map { $0.total.symbolFormatted }.joined(separator: " · ")
+        default:
+            return nil
+        }
     }
 
     private func statusRow(name: String, status: String, tint: Color = .accentColor,
@@ -1077,19 +1162,21 @@ struct PopoverHomeView: View {
                            critical: Bool = false, resetSuffix: String? = nil,
                            subtitle: String? = nil, subtitleCritical: Bool = false,
                            staleBadge: String? = nil,
-                           windows: [QuotaWindow] = []) -> some View {
+                           windows: [QuotaWindow] = [],
+                           nameDetail: String? = nil,
+                           problem: RowProblem? = nil) -> some View {
         StatusRow(name: name, status: status, statusColor: statusColor,
                   critical: critical, resetSuffix: resetSuffix, subtitle: subtitle,
                   subtitleCritical: subtitleCritical, staleBadge: staleBadge,
-                  windows: windows, tint: tint)
+                  windows: windows, nameDetail: nameDetail, problem: problem, tint: tint)
     }
 
 }
 
-/// 趋势折线图独占悬停状态（UI-2，同 PopoverHeatmap 模式）：悬停只重渲
-/// 本子视图，不重渲整页。悬停信息行放在图上方、固定行高，无悬停时空占位。
+/// Trend line chart. Hover state lives here, so hovering re-renders only
+/// this view; the readout row above the chart keeps a fixed height.
 private struct TrendChartView: View {
-    /// 最近 60 天（含今天）按日排序的用量序列。
+    /// Daily usage for the last 60 days (today included), oldest first.
     let series: [(key: Int64, tokens: Int64)]
 
     @State private var hoveredTrend: (key: Int64, tokens: Int64)?
@@ -1105,8 +1192,8 @@ private struct TrendChartView: View {
                 Spacer()
             }
             .frame(height: 16)
-            // Charts 平滑折线（catmullRom）。冷启动延迟由热力图缓存解决：
-            // 打开时先用上次持久化的数据立即渲染，再异步刷新新曲线。
+            // Smoothed line (catmullRom). The persisted heatmap cache covers the
+            // cold start; fresh data replaces it asynchronously.
             Chart(series, id: \.key) { d in
                 AreaMark(
                     x: .value("Day", dayFromKey(d.key)),
@@ -1125,7 +1212,7 @@ private struct TrendChartView: View {
                 .interpolationMethod(.catmullRom)
             }
             .chartXAxis {
-                // 3 个日期标签，颜色与 Activity 月份标签一致（TMDesign.quiet）。
+                // Three date labels, colored like the Activity month labels.
                 AxisMarks(values: .automatic(desiredCount: 3)) { _ in
                     AxisGridLine().foregroundStyle(Color.primary.opacity(0.08))
                     AxisValueLabel(format: .dateTime.month(.defaultDigits).day())
@@ -1189,15 +1276,11 @@ private struct NativePeriodSelector: NSViewRepresentable {
             action: #selector(Coordinator.selectionChanged(_:))
         )
         control.segmentDistribution = .fillEqually
+        control.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         control.selectedSegment = selectedIndex
+        control.controlSize = Self.nativeSize
         if #available(macOS 26.0, *) {
-            // The current macOS value-selection control uses the system's
-            // extra-large 36 pt metric. `.large` is the 28 pt compact form
-            // and is why the popover still looked like the previous design.
-            control.controlSize = .extraLarge
             control.borderShape = .capsule
-        } else {
-            control.controlSize = .large
         }
         if #available(macOS 27.0, *) {
             control.role = .tabs
@@ -1207,6 +1290,16 @@ private struct NativePeriodSelector: NSViewRepresentable {
         return control
     }
 
+    /// Takes the width it is offered and claims none of its own. Its
+    /// intrinsic width (366 pt with these labels) is wider than a card, and
+    /// once the panel measured its content's ideal width that pushed every
+    /// card past the panel's right inset.
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView control: NSSegmentedControl,
+                      context: Context) -> CGSize? {
+        let width = proposal.width.flatMap { $0.isFinite ? $0 : nil } ?? 0
+        return CGSize(width: width, height: control.intrinsicContentSize.height)
+    }
+
     func updateNSView(_ control: NSSegmentedControl, context: Context) {
         context.coordinator.selection = $selection
         for (index, label) in labels.enumerated() where index < control.segmentCount {
@@ -1214,21 +1307,22 @@ private struct NativePeriodSelector: NSViewRepresentable {
                 control.setLabel(label, forSegment: index)
             }
         }
-        // SwiftUI can propagate the root `.small` environment into the
-        // represented NSControl after makeNSView. Reassert the platform's
-        // native metric on updates so its intrinsic height remains 36 pt.
-        if #available(macOS 26.0, *) {
-            if control.controlSize != .extraLarge {
-                control.controlSize = .extraLarge
-                control.invalidateIntrinsicContentSize()
-            }
-        } else if control.controlSize != .large {
-            control.controlSize = .large
+        // SwiftUI can push the root `.small` environment into the control
+        // after makeNSView; reassert the native size.
+        if control.controlSize != Self.nativeSize {
+            control.controlSize = Self.nativeSize
             control.invalidateIntrinsicContentSize()
         }
         if control.selectedSegment != selectedIndex {
             control.selectedSegment = selectedIndex
         }
+    }
+
+    /// The system's metric for a value-selection capsule: extra-large
+    /// (36 pt) on macOS 26 and later, large (28 pt) before.
+    private static var nativeSize: NSControl.ControlSize {
+        if #available(macOS 26.0, *) { return .extraLarge }
+        return .large
     }
 
     private var selectedIndex: Int {
@@ -1253,15 +1347,15 @@ private struct NativePeriodSelector: NSViewRepresentable {
 
 
 /// Drives the hero number transition: any change to the token count OR the
-/// 缩写/完整 format toggle re-runs the same numericText animation.
+/// compact/full format toggle re-runs the same numericText animation.
 private struct HeroValue: Equatable {
     let tokens: Int64
     let full: Bool
 }
 
-/// 额度状态行：名称 primary，状态按健康状态着色。纯信息行，不引导跳转。
-/// 状态主文本是 SF Pro Regular + 等宽数字；可选的 "resets in …" 后缀单独用
-/// SF Mono Regular，不让整行变成等宽。
+/// Quota status row: primary name, status colored by health. Information only.
+/// Status text is SF Pro with tabular digits; the optional "resets in …"
+/// suffix alone is SF Mono, so the whole row is not monospaced.
 private struct StatusRow: View {
     @AppStorage(QuotaWindow.showsRemainingKey) private var showsRemaining = false
     let name: String
@@ -1291,6 +1385,10 @@ private struct StatusRow: View {
     /// "name + one bar per window"; the plain status text is only for
     /// states without numbers (Loading / Error / Off / Subscribed).
     var windows: [QuotaWindow] = []
+    /// Quiet text on the name's line, right after it (a balance's days left).
+    var nameDetail: String?
+    /// Why the row could not refresh; shown as a "?" after the name.
+    var problem: RowProblem?
     /// The service's color; every window bar of one service shares it.
     var tint: Color = .accentColor
 
@@ -1323,6 +1421,7 @@ private struct StatusRow: View {
                 .font(TMType.medium(TMType.body))
                 .foregroundStyle(.primary)
                 .lineLimit(1)
+            if let problem { RowProblemButton(problem: problem) }
             Spacer(minLength: 8)
             if let staleBadge {
                 Text(staleBadge)
@@ -1339,14 +1438,22 @@ private struct StatusRow: View {
 
     private var content: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            // 固定两行高度：空字符串 Text 固有高度会塌缩为 0，所以用
-            // 显式 frame 占位——Loading → 数据切换时行高恒定，面板不跳。
+            // Fixed two-line height: an empty Text collapses to zero, so an explicit
+            // frame keeps the row height constant from Loading to data.
             VStack(alignment: .leading, spacing: 2) {
-                Text(name)
-                    .font(TMType.medium(TMType.body))
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
-                    .frame(height: TMLayout.quotaPrimaryLineHeight, alignment: .leading)
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(name)
+                        .font(TMType.medium(TMType.body))
+                        .foregroundStyle(.primary)
+                    if let problem { RowProblemButton(problem: problem) }
+                    if let nameDetail {
+                        Text(nameDetail)
+                            .font(TMType.number(TMType.caption))
+                            .foregroundStyle(critical ? TMDesign.danger : TMDesign.quiet)
+                    }
+                }
+                .lineLimit(1)
+                .frame(height: TMLayout.quotaPrimaryLineHeight, alignment: .leading)
                 if hasSecondLine {
                     Text(resetSuffix ?? "")
                         .font(TMType.number(TMType.micro))
@@ -1393,8 +1500,82 @@ private struct StatusRow: View {
     }
 }
 
-private enum HistoryMode: String {
+/// Healthy balances, one compact row each — the same name-left,
+/// amount-right rows and spacing as the Sources card.
+private struct BalanceLine: View {
+    let items: [(name: String, value: String)]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            ForEach(items, id: \.name) { item in
+                HStack(alignment: .firstTextBaseline) {
+                    Text(item.name)
+                        .font(TMType.medium(TMType.body))
+                        .foregroundStyle(.primary)
+                    Spacer()
+                    Text(item.value)
+                        .font(TMType.number(TMType.body))
+                        .foregroundStyle(.secondary)
+                }
+                .lineLimit(1)
+                .accessibilityElement(children: .combine)
+            }
+        }
+    }
+}
+
+private enum HistoryMode: String, CaseIterable {
     case heatmap, trend
+
+    var symbol: String { self == .heatmap ? "square.grid.3x3.fill" : "chart.xyaxis.line" }
+    var title: String { self == .heatmap ? "Heatmap" : "Trend" }
+}
+
+/// Icon-only NSSegmentedControl for the Activity card, styled like
+/// `NativePeriodSelector`.
+private struct NativeHistorySelector: NSViewRepresentable {
+    @Binding var selection: HistoryMode
+
+    func makeCoordinator() -> Coordinator { Coordinator(selection: $selection) }
+
+    func makeNSView(context: Context) -> NSSegmentedControl {
+        let modes = HistoryMode.allCases
+        let control = NSSegmentedControl(
+            images: modes.map { NSImage(systemSymbolName: $0.symbol, accessibilityDescription: $0.title)! },
+            trackingMode: .selectOne,
+            target: context.coordinator,
+            action: #selector(Coordinator.selectionChanged(_:)))
+        control.controlSize = .small
+        if #available(macOS 26.0, *) {
+            control.borderShape = .capsule
+        }
+        if #available(macOS 27.0, *) {
+            control.role = .tabs
+        }
+        for (index, mode) in modes.enumerated() {
+            control.setToolTip(mode.title, forSegment: index)
+        }
+        control.selectedSegment = modes.firstIndex(of: selection) ?? 0
+        return control
+    }
+
+    func updateNSView(_ control: NSSegmentedControl, context: Context) {
+        context.coordinator.selection = $selection
+        let index = HistoryMode.allCases.firstIndex(of: selection) ?? 0
+        if control.selectedSegment != index { control.selectedSegment = index }
+    }
+
+    @MainActor
+    final class Coordinator: NSObject {
+        var selection: Binding<HistoryMode>
+        init(selection: Binding<HistoryMode>) { self.selection = selection }
+
+        @objc func selectionChanged(_ sender: NSSegmentedControl) {
+            let modes = HistoryMode.allCases
+            guard modes.indices.contains(sender.selectedSegment) else { return }
+            selection.wrappedValue = modes[sender.selectedSegment]
+        }
+    }
 }
 
 /// Popover section card: faint tonal fill, continuous corners, and a title
@@ -1417,16 +1598,18 @@ private struct PopoverCard<Accessory: View, Trailing: View, Content: View>: View
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
-            HStack(spacing: 8) {
-                // Title case, matching the dashboard cards.
-                Text(title)
-                    .font(TMType.semibold(12))
-                    .foregroundStyle(TMDesign.quiet)
-                accessory
-                Spacer(minLength: 6)
-                trailing
+            if !title.isEmpty {
+                HStack(spacing: 8) {
+                    // Title case, matching the dashboard cards.
+                    Text(title)
+                        .font(TMType.semibold(12))
+                        .foregroundStyle(TMDesign.quiet)
+                    accessory
+                    Spacer(minLength: 6)
+                    trailing
+                }
+                .frame(height: 16)
             }
-            .frame(height: 16)
             content
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1448,7 +1631,8 @@ struct QuotaWindow {
     let usedPercent: Double
     /// Compact countdown ("3.9d", "2.1h"), nil once passed / unknown.
     let resetIn: String?
-
+    /// 0…1, how much of the window's time has passed; nil if unknown.
+    var elapsed: Double?
 }
 
 /// ```
@@ -1486,33 +1670,99 @@ private struct QuotaWindowLine: View {
                     .font(TMType.number(TMType.caption, weight: .medium))
                     .foregroundStyle(.primary)
             }
-            UsageBar(usedPercent: window.usedPercent, tint: tint)
+            UsageBar(usedPercent: window.usedPercent, tint: tint, elapsed: window.elapsed)
         }
-        .help("\(window.label): \(shownPercent)% \(showsRemaining ? "left" : "used")"
-              + (window.resetIn.map { ", resets in \($0)" } ?? ""))
     }
 }
 
 /// Usage bar: empty = untouched, fills rightward as the window is used.
 /// Always shows usage; the used/remaining setting changes only the number.
 /// Filled with the service's color at every usage level.
+///
+/// With a time mark, solid color runs to whichever comes first, usage or
+/// elapsed time; the stretch between the two is one step lighter. Behind
+/// time it is a darker track (headroom); past time it is a paler fill
+/// (using the window faster than it passes). Either way the solid edge is
+/// the time mark, so it never disappears under the fill.
 private struct UsageBar: View {
     let usedPercent: Double
     let tint: Color
+    /// 0…1 share of the window's time already passed.
+    var elapsed: Double?
 
     var body: some View {
-        let used = usedPercent / 100
+        let used = min(max(usedPercent / 100, 0), 1)
         GeometryReader { geo in
+            let usedWidth = used > 0 ? max(geo.size.width * used, 4) : 0
+            let timeWidth = elapsed.map { $0 > 0 ? max(geo.size.width * min($0, 1), 4) : 0 }
             ZStack(alignment: .leading) {
-                Capsule().fill(Color.primary.opacity(0.08))
-                Capsule()
-                    .fill(tint)
-                    .frame(width: used > 0 ? max(geo.size.width * min(used, 1), 4) : 0)
-                    .animation(.easeOut(duration: 0.35), value: used)
+                Capsule().fill(Color.primary.opacity(0.06))
+                if let timeWidth, usedWidth > timeWidth {
+                    Capsule()
+                        .fill(tint.opacity(0.45))
+                        .frame(width: usedWidth)
+                    Capsule()
+                        .fill(tint)
+                        .frame(width: timeWidth)
+                } else {
+                    if let timeWidth, timeWidth > 0 {
+                        Capsule()
+                            .fill(Color.primary.opacity(0.12))
+                            .frame(width: timeWidth)
+                    }
+                    Capsule()
+                        .fill(tint)
+                        .frame(width: usedWidth)
+                }
+            }
+            .animation(.easeOut(duration: 0.35), value: used)
+        }
+        .frame(height: 4)
+        .accessibilityHidden(true)
+    }
+}
+
+/// Composition bar for Sources: the parts always fill the whole width, each
+/// its own rounded segment with a gap between, like the storage bar in
+/// System Settings. Deliberately unlike `UsageBar`, which is a gauge on an
+/// empty track.
+struct SourceBar: View {
+    static let gap: CGFloat = 2
+    static let minSegment: CGFloat = 4
+
+    let segments: [(value: Double, color: Color)]
+
+    var body: some View {
+        let visible = segments.filter { $0.value > 0 }
+        GeometryReader { geo in
+            let widths = Self.widths(for: visible.map(\.value), in: geo.size.width)
+            HStack(spacing: Self.gap) {
+                ForEach(visible.indices, id: \.self) { i in
+                    Capsule()
+                        .fill(visible[i].color)
+                        .frame(width: widths[i])
+                }
             }
         }
         .frame(height: 4)
         .accessibilityHidden(true)
+    }
+
+    /// Proportional widths that, with the gaps, sum to `width`. Every segment
+    /// gets at least `minSegment` so a tiny share stays a visible pill; the
+    /// difference comes out of the larger segments.
+    static func widths(for values: [Double], in width: CGFloat) -> [CGFloat] {
+        let total = values.reduce(0, +)
+        guard !values.isEmpty, total > 0 else { return [] }
+        let available = max(width - gap * CGFloat(values.count - 1), 0)
+        let floor = min(minSegment, available / CGFloat(values.count))
+        var widths = values.map { max(available * CGFloat($0 / total), floor) }
+        let excess = widths.reduce(0, +) - available
+        let slack = widths.reduce(0) { $0 + ($1 - floor) }
+        if excess > 0, slack > 0 {
+            widths = widths.map { $0 - excess * ($0 - floor) / slack }
+        }
+        return widths
     }
 }
 
@@ -1522,27 +1772,24 @@ private struct UsageBar: View {
 private struct HeroChip: View {
     let label: String
     let value: String
-    var warning: String?
+    var problem: RowProblem?
 
     var body: some View {
         HStack(spacing: 5) {
-            Text(label)
-                .font(TMType.regular(TMType.caption))
-                .foregroundStyle(TMDesign.quiet)
-            Text(value)
-                .font(TMType.number(TMType.caption, weight: .semibold))
-                .foregroundStyle(.primary)
-                .lineLimit(1)
-            if let warning {
-                Image(systemName: "clock.badge.exclamationmark")
-                    .font(.system(size: 10))
-                    .foregroundStyle(TMDesign.danger)
-                    .help(warning)
+            HStack(spacing: 5) {
+                Text(label)
+                    .font(TMType.regular(TMType.caption))
+                    .foregroundStyle(TMDesign.quiet)
+                Text(value)
+                    .font(TMType.number(TMType.caption, weight: .semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
             }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(label)
+            .accessibilityValue(Text(value))
+            if let problem { RowProblemButton(problem: problem) }
         }
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(label)
-        .accessibilityValue(Text(value))
     }
 }
 
@@ -1574,19 +1821,17 @@ private struct UnconnectedSourcesRow: View {
     }
 }
 
-/// 紧凑近半年活动热力图（Popover 版）：26 周 × 7 天方格，月份标签悬浮在
-/// 网格上方。无悬停交互——活跃度一眼扫读即可。
-private struct PopoverHeatmap: View {
+/// Compact activity heatmap for the popover: 24 weeks × 7 days, month
+/// labels above the grid, and a hover readout row.
+struct PopoverHeatmap: View {
     let weeks: [[Int64?]]
     let heatmap: [Int64: Int64]
-    let maxTokens: Int64
 
-    /// 24 周：格间距收到 2pt 后格子仍够大，高度比 20 周 × 3pt 更省。
+    /// 24 weeks keeps cells large enough with a 2 pt gutter.
     static let weekCount = 24
-    /// 网格与月份标签的垂直间距。
-    private static let labelGap: CGFloat = 12
+    /// Vertical gap between the month labels and the grid.
+    private static let labelGap: CGFloat = 16
     private static let cellGutter: CGFloat = 2
-    private static let hoverRowHeight: CGFloat = 11
     private var labelGap: CGFloat { Self.labelGap }
     private var cellGutter: CGFloat { Self.cellGutter }
 
@@ -1597,12 +1842,29 @@ private struct PopoverHeatmap: View {
         return labelGap + 7 * cell + 6 * cellGutter
     }
 
-    /// Whole view (hover row + grid); the trend view reuses it so the card
-    /// keeps one height in both modes.
-    static var totalHeight: CGFloat { hoverRowHeight + 4 + gridHeight }
+    /// The trend view reuses it so the card keeps one height in both modes.
+    static var totalHeight: CGFloat { gridHeight }
 
-    /// 月份标签放在每月第一次出现的那一列上（而不是均分），首列若离下一
-    /// 个标签太近则省略，避免重叠。
+    /// Opacity of the accent for levels 1…4 — one hue, light to strong.
+    private static let levelOpacity: [Double] = [0.28, 0.5, 0.75, 1]
+
+    /// Quartile cut points of the active days' totals. Levels follow rank,
+    /// not share of the peak, so one huge day can't flatten every other day
+    /// into the same shade.
+    static func thresholds(_ values: [Int64]) -> [Int64] {
+        let active = values.filter { $0 > 0 }.sorted()
+        guard !active.isEmpty else { return [] }
+        return [1, 2, 3].map { active[min(active.count - 1, active.count * $0 / 4)] }
+    }
+
+    /// 0 for no usage, else 1…4 by quartile.
+    static func level(_ value: Int64, thresholds: [Int64]) -> Int {
+        guard value > 0 else { return 0 }
+        return 1 + thresholds.filter { value >= $0 }.count
+    }
+
+    /// Month labels sit on each month's first column; the first label is
+    /// dropped when it would overlap the next.
     private var monthLabels: [(index: Int, label: String)] {
         var out: [(Int, String)] = []
         var lastMonth = -1
@@ -1617,67 +1879,43 @@ private struct PopoverHeatmap: View {
         return out
     }
 
-    @State private var hoveredDay: (key: Int64, tokens: Int64)?
-
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            // 悬停信息行：无悬停时空占位，保持高度稳定。
-            HStack {
-                if let h = hoveredDay {
-                    Text("\(shortDayFormatter.string(from: dayFromKey(h.key))) · \(Format.compact(h.tokens)) tokens")
-                        .font(TMType.number(9))
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-            }
-            .frame(height: Self.hoverRowHeight)
-            GeometryReader { geo in
-                let cell = max((geo.size.width - CGFloat(weeks.count - 1) * cellGutter) / CGFloat(weeks.count), 2)
-                ZStack(alignment: .topLeading) {
-                    HStack(alignment: .top, spacing: cellGutter) {
-                        ForEach(weeks.indices, id: \.self) { wi in
-                            VStack(spacing: cellGutter) {
-                                ForEach(0..<7, id: \.self) { di in
-                                    heatCell(weeks[wi][di], size: cell)
-                                }
+        let cuts = Self.thresholds(weeks.joined().compactMap { $0.flatMap { heatmap[$0] } })
+        GeometryReader { geo in
+            let cell = max((geo.size.width - CGFloat(weeks.count - 1) * cellGutter) / CGFloat(weeks.count), 2)
+            ZStack(alignment: .topLeading) {
+                HStack(alignment: .top, spacing: cellGutter) {
+                    ForEach(weeks.indices, id: \.self) { wi in
+                        VStack(spacing: cellGutter) {
+                            ForEach(0..<7, id: \.self) { di in
+                                heatCell(weeks[wi][di], size: cell, thresholds: cuts)
                             }
                         }
                     }
-                    .padding(.top, labelGap)
-                    ForEach(monthLabels, id: \.index) { m in
-                        Text(m.label)
-                            .font(TMType.number(9))
-                            .foregroundStyle(TMDesign.quiet)
-                            .fixedSize()
-                            .offset(x: CGFloat(m.index) * (cell + cellGutter), y: 0)
-                    }
+                }
+                .padding(.top, labelGap)
+                ForEach(monthLabels, id: \.index) { m in
+                    Text(m.label)
+                        .font(TMType.number(9))
+                        .foregroundStyle(TMDesign.quiet)
+                        .fixedSize()
+                        .offset(x: CGFloat(m.index) * (cell + cellGutter), y: 0)
                 }
             }
-            .frame(height: Self.gridHeight)
         }
+        .frame(height: Self.gridHeight)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Activity heatmap, last \(Self.weekCount) weeks")
     }
 
-    private func heatCell(_ key: Int64?, size: CGFloat) -> some View {
+    private func heatCell(_ key: Int64?, size: CGFloat, thresholds: [Int64]) -> some View {
         let v = key.flatMap { heatmap[$0] } ?? 0
-        let ratio = maxTokens > 0 ? Double(v) / Double(maxTokens) : 0
-        // A 0.52 lower bound keeps any populated day distinct from the
-        // empty-cell track while preserving relative intensity for large days.
-        let opacity = max(0.52, 0.28 + 0.72 * ratio)
+        let level = Self.level(v, thresholds: thresholds)
         return RoundedRectangle(cornerRadius: 2.5, style: .continuous)
-            .fill(v > 0
-                  ? TMDesign.accent.opacity(opacity)
-                  : Color.primary.opacity(0.10))
+            .fill(level > 0
+                  ? TMDesign.accent.opacity(Self.levelOpacity[level - 1])
+                  : Color.primary.opacity(0.08))
             .frame(width: size, height: size)
-            .contentShape(Rectangle())
-            .onHover { hovering in
-                if hovering, let key {
-                    hoveredDay = (key, v)
-                } else if hoveredDay?.key == key {
-                    hoveredDay = nil
-                }
-            }
             .accessibilityElement()
             .accessibilityLabel(key.map { shortDayFormatter.string(from: dayFromKey($0)) } ?? "")
             .accessibilityValue("\(Format.full(v)) tokens")

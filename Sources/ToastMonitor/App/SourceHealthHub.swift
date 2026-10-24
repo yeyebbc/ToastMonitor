@@ -1,7 +1,7 @@
 import Foundation
 import Combine
 
-/// Per-source collection health, observable by the UI (spec §3.2 数据来源).
+/// Per-source collection health, observable by the UI.
 struct SourceHealth: Identifiable, Equatable {
     let tool: String
     var mode: String          // "local" | "remote"
@@ -25,7 +25,7 @@ struct SourceHealth: Identifiable, Equatable {
 }
 
 extension SourceHealth {
-    /// 全 App 统一的过期阈值（本机源与远程 feed 共用，避免双份硬编码漂移）。
+    /// One staleness threshold for local sources and the remote feed alike.
     static let staleThreshold: TimeInterval = 120
 }
 
@@ -51,6 +51,14 @@ final class SourceHealthHub: ObservableObject {
         } else {
             sources.append(h)
         }
+    }
+
+    /// Drop the remote feed and any remote-mode records once remote ingestion
+    /// is disabled; nothing refreshes them afterwards, so they would otherwise
+    /// age into a permanent "stale" status.
+    func purgeRemote() {
+        let kept = sources.filter { $0.tool != "remote-feed" && $0.mode != "remote" }
+        if kept.count != sources.count { sources = kept }
     }
 
     /// An unchanged scan is still a successful parse. Clear an old error so a

@@ -63,15 +63,25 @@ final class ClaudeQuotaClient: ObservableObject {
     @Published private(set) var enabled: Bool
     @Published private(set) var state = State()
 
+    /// README screenshots only (`--demo`): shows made-up numbers instead of
+    /// fetching anything.
+    func showDemo(_ demo: State) {
+        isDemo = true
+        enabled = true
+        state = demo
+    }
+    /// Set by `showDemo`; a demo client never fetches, so nothing real can
+    /// replace the made-up numbers.
+    private var isDemo = false
+
     private var timer: Timer?
     private var started = false
     private var inFlight = false
     private var refreshGeneration: UInt64 = 0
 
     /// Consecutive-failure counter driving the backoff schedule (reset on
-    /// any success). Wall-clock based and persisted, not systemUptime-based —
-    /// systemUptime resets on every relaunch, which previously meant
-    /// restarting the app silently discarded a server-imposed backoff.
+    /// any success). Wall-clock based and persisted, not systemUptime-based,
+    /// so a relaunch cannot discard a server-imposed backoff.
     private var backoffAttempt = 0
     private var nextAllowedRefresh: TimeInterval = 0
     /// Last attempt time (success or failure), independent of the backoff
@@ -197,7 +207,7 @@ final class ClaudeQuotaClient: ObservableObject {
     ///   by the explicit "Refresh" button); a real server-imposed backoff
     ///   from `nextAllowedRefresh` still applies even when forced.
     func refresh(force: Bool = false) {
-        guard enabled else { return }
+        guard enabled, !isDemo else { return }
         guard !inFlight else { return }
         let now = Date().timeIntervalSince1970
         guard now >= nextAllowedRefresh else { return }
@@ -242,10 +252,11 @@ final class ClaudeQuotaClient: ObservableObject {
                 if let expiresAt = resolved.expiresAt,
                    expiresAt <= Int64(Date().timeIntervalSince1970) {
                     // Still expired even after attempting a CLI-delegated
-                    // refresh (no `claude` binary found, the probe couldn't
-                    // complete in time, or the login is genuinely gone).
+                    // refresh (no `claude` binary found, one Gatekeeper would
+                    // block, the probe couldn't complete in time, or the login
+                    // is genuinely gone).
                     self.inFlight = false
-                    self.state.error = "Claude login expired (run claude to refresh)"
+                    self.state.error = "Login expired — run claude in Terminal"
                     self.applyBackoff(retryAfterHeader: nil)
                     return
                 }
@@ -313,11 +324,9 @@ final class ClaudeQuotaClient: ObservableObject {
     /// its ACL only while an earlier "Always Allow" still stands, and in
     /// practice that authorization does not stay put — a one-time "Allow"
     /// never persists at all, and Claude Code rewrites the item several times
-    /// a day as it refreshes the token. Whatever the cause, the consequence
-    /// used to be a modal SecurityAgent sheet asking for the login keychain
-    /// password, raised from a background poll the user never initiated.
-    /// An unauthorized read now fails instead, and `securityToolCredentials`
-    /// recovers from it without involving the user.
+    /// a day as it refreshes the token. An interactive read would raise a
+    /// login-keychain password sheet from a background poll; instead an
+    /// unauthorized read fails and `securityToolCredentials` recovers.
     private nonisolated static func keychainCredentials() -> Data? {
         var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,

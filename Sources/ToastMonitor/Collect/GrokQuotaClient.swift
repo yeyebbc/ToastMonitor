@@ -1,7 +1,7 @@
 import Foundation
 import Combine
 
-/// Grok plan (Xpass, formerly SuperGrok) weekly quota via the Grok CLI
+/// Grok plan (SuperGrok, now sold as part of The X Subscription) weekly quota via the Grok CLI
 /// billing proxy (same approach as CodexBar): reads the bearer token `grok login` stores in
 /// ~/.grok/auth.json (never persisted anywhere in ToastMonitor) and GETs
 /// https://cli-chat-proxy.grok.com/v1/billing?format=credits, plus
@@ -68,13 +68,21 @@ final class GrokQuotaClient: ObservableObject {
     }
 
     @Published private(set) var state = State()
-    private var timer: Timer?
+
+    /// README screenshots only (`--demo`): shows made-up numbers instead of
+    /// fetching anything.
+    func showDemo(_ demo: State) {
+        isDemo = true
+        state = demo
+    }
+    /// Set by `showDemo`; a demo client never fetches, so nothing real can
+    /// replace the made-up numbers.
+    private var isDemo = false
     private var started = false
     private var inFlight = false
     private var refreshGeneration: UInt64 = 0
-    /// Backoff (M1): failed refreshes wait 60s → 2m → 5m → 15m; success resets.
-    private var backoffBase: TimeInterval = 0
-    private var nextAllowedRefresh: TimeInterval = 0
+    private var backoff = RefreshBackoff()
+    private let poller = ForegroundPoller()
 
     private let session: URLSession
     /// Retained because URLSession delegates are weak.
@@ -85,66 +93,23 @@ final class GrokQuotaClient: ObservableObject {
         cfg.timeoutIntervalForRequest = 15
         cfg.timeoutIntervalForResource = 30
         session = URLSession(configuration: cfg, delegate: redirectBlocker, delegateQueue: nil)
-        observeForeground()
     }
 
     // MARK: - Foreground-aware refresh
-
-    private var popoverVisible = false
-    private var dashboardVisible = false
-    private var foreground = false
-
-    private func updateForeground() {
-        let fg = popoverVisible || dashboardVisible
-        // At launch the app is hidden and the timer has not been installed
-        // yet, so the missing timer is also a valid state transition.
-        guard fg != foreground || timer == nil else { return }
-        foreground = fg
-        startTimer(interval: TMRefreshPolicy.quotaInterval(foreground: fg))
-        if fg {
-            refresh()
-        }
-    }
-
-    private func observeForeground() {
-        for name in [TMNotifications.popoverVisibility, TMNotifications.dashboardVisibility] {
-            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
-                let visible = (note.object as? Bool) ?? false
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    if name == TMNotifications.popoverVisibility {
-                        self.popoverVisible = visible
-                    } else {
-                        self.dashboardVisible = visible
-                    }
-                    self.updateForeground()
-                }
-            }
-        }
-    }
 
     func start() {
         guard !started else { return }
         started = true
         refresh()
-        updateForeground()
-    }
-
-    private func startTimer(interval: TimeInterval) {
-        timer?.invalidate()
-        let t = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refresh() }
-        }
-        RunLoop.main.add(t, forMode: .common)
-        timer = t
+        poller.start { [weak self] in MainActor.assumeIsolated { self?.refresh() } }
     }
 
     // MARK: - Refresh
 
     func refresh() {
-        guard !inFlight else { return }
-        // Backoff gate (M1): skip attempts inside the backoff window.
-        if ProcessInfo.processInfo.systemUptime < nextAllowedRefresh { return }
+        guard !inFlight, !isDemo else { return }
+        // Backoff gate: skip attempts inside the backoff window.
+        if backoff.isWaiting { return }
         inFlight = true
         refreshGeneration &+= 1
         let generation = refreshGeneration
@@ -264,7 +229,7 @@ final class GrokQuotaClient: ObservableObject {
             case .success(let data)?:
                 guard var snapshot = Self.parseBilling(data) else {
                     self.state.error = "Failed to parse Grok billing response"
-                    self.applyBackoff()
+                    self.backoff.failed()
                     return
                 }
                 if let plan = settingsData.flatMap(Self.parsePlanName) {
@@ -273,10 +238,10 @@ final class GrokQuotaClient: ObservableObject {
                 self.apply(snapshot)
             case .failure(let error)?:
                 self.state.error = Self.message(for: error)
-                self.applyBackoff()
+                self.backoff.failed()
             case nil:
                 self.state.error = "Grok billing request failed"
-                self.applyBackoff()
+                self.backoff.failed()
             }
         }
     }
@@ -291,16 +256,9 @@ final class GrokQuotaClient: ObservableObject {
         state.prepaidBalanceUSD = snapshot.prepaidBalanceUSD
         state.lastSync = Int64(Date().timeIntervalSince1970)
         state.error = nil
-        backoffBase = 0
+        backoff.succeeded()
     }
 
-    /// Exponential backoff (M1): 60s → 2m → 5m → 15m, capped.
-    private func applyBackoff() {
-        let now = ProcessInfo.processInfo.systemUptime
-        backoffBase = min(max(backoffBase, 60), 15 * 60)
-        nextAllowedRefresh = now + backoffBase
-        backoffBase *= 2
-    }
 
     nonisolated static func message(for error: CommandCodeQuotaClient.HTTPError) -> String {
         switch error {
@@ -380,6 +338,16 @@ final class GrokQuotaClient: ObservableObject {
         let sum = out.reduce(0) { $0 + $1.usedPercent }
         guard abs(sum - total) <= 1 else { return [] }
         return out.filter { $0.usedPercent > 0 }.sorted { $0.usedPercent > $1.usedPercent }
+    }
+
+    /// The plan recorded under Settings › Sources › Subscriptions (plan
+    /// "grok") wins over the API's tier: the API still reports some X
+    /// Subscription accounts as "SuperGrok".
+    nonisolated static func plan(subscriptions: [Database.Subscription], apiPlan: String?,
+                                 now: Date = Date()) -> String? {
+        let nowSeconds = Int64(now.timeIntervalSince1970)
+        return subscriptions.first { $0.plan == "grok" && ($0.endDate == 0 || $0.endDate > nowSeconds) }?.name
+            ?? apiPlan
     }
 
     /// `/v1/settings` → `subscription_tier_display`.

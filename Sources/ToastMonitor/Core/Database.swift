@@ -238,7 +238,7 @@ final class Database: @unchecked Sendable {
     }
 
 
-    /// P0-3: rebuilds `turns` without the legacy compound UNIQUE constraint
+    /// Rebuilds `turns` without the legacy compound UNIQUE constraint
     /// when SQLite's autoindex for it is still present. Data is preserved;
     /// the event_id index becomes the sole dedupe authority.
     private func migrateDropLegacyTurnsUnique() {
@@ -386,7 +386,7 @@ final class Database: @unchecked Sendable {
     }
 
     private func migrate() {
-        // Versioned migrations (spec §7): schema version tracked in
+        // Versioned migrations: schema version tracked in
         // PRAGMA user_version; each version runs once, in order.
         let current = userVersion()
         if current < 1 {
@@ -415,7 +415,7 @@ final class Database: @unchecked Sendable {
         CREATE INDEX IF NOT EXISTS idx_turns_ts ON turns(ts);
         CREATE INDEX IF NOT EXISTS idx_turns_tool ON turns(tool, ts);
         CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(tool, session_id);
-        -- Partial index for the cost backfill scan (M5): only rows that still
+        -- Partial index for the cost backfill scan: only rows that still
         -- need pricing, so the 60s backfill never full-scans the table.
         CREATE INDEX IF NOT EXISTS idx_turns_backfill
           ON turns(id) WHERE cost = 0 AND tool != 'hermes'
@@ -431,7 +431,7 @@ final class Database: @unchecked Sendable {
           updated INTEGER NOT NULL DEFAULT 0,
           PRIMARY KEY(tool, session_id)
         );
-        -- Recent-session ordering (L4): sessions() sorts by updated DESC.
+        -- Recent-session ordering: sessions() sorts by updated DESC.
         -- Created after the sessions table (the earlier position referenced
         -- a table that may not exist yet on fresh installs).
         CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(tool, updated);
@@ -495,16 +495,16 @@ final class Database: @unchecked Sendable {
           currency TEXT NOT NULL DEFAULT 'USD'
         );
 
-        -- P0-9 migration: rebuild id=0 rows with real auto-increment ids.
+        -- Rebuild id=0 rows with real auto-increment ids.
         INSERT INTO subscriptions (name, plan, start_date, cycle, price, currency)
         SELECT name, plan, start_date, cycle, price, currency FROM subscriptions WHERE id=0;
         DELETE FROM subscriptions WHERE id=0;
 
-        -- P0-3: the event_id unique index is created AFTER the legacy table
+        -- The event_id unique index is created AFTER the legacy table
         -- rebuild (see migrateDropLegacyTurnsUnique) — on legacy schemas the
         -- column does not exist yet and index creation would abort the batch.
 
-        -- P0-3 migration: the legacy table-level UNIQUE(tool, session_id, ts,
+        -- The legacy table-level UNIQUE(tool, session_id, ts,
         -- input, output) must go — it still swallows distinct events that
         -- share the same second and token counts. Rebuild the table without it.
         -- (Detected by the presence of SQLite's autoindex for that constraint.)
@@ -552,9 +552,8 @@ final class Database: @unchecked Sendable {
                 transactionWriteError = false
             }
         }
-        // v4: openrouter_snapshots account columns. These used to be ensured
-        // on every insert (L2) — three pragma_table_info probes per snapshot
-        // write on the hot path. Fold into the versioned migration instead.
+        // v4: openrouter_snapshots account columns, added here once rather
+        // than probed on every snapshot insert.
         if previousVersion < 4 {
             guard let db else { return }
             guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return }
@@ -573,7 +572,57 @@ final class Database: @unchecked Sendable {
                 transactionWriteError = false
             }
         }
+        // v5: per-call timing (time to first token, output speed). Kept apart
+        // from `turns` so its merge-by-request upserts never touch usage rows,
+        // with its own cursors so a first run backfills existing transcripts.
+        if previousVersion < 5 {
+            guard let db else { return }
+            guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return }
+            let ok = execChecked("""
+            CREATE TABLE IF NOT EXISTS perf_samples (
+              tool TEXT NOT NULL,
+              key TEXT NOT NULL,
+              model TEXT,
+              request_ms INTEGER,
+              first_ms INTEGER,
+              last_ms INTEGER,
+              output_tokens INTEGER NOT NULL DEFAULT 0,
+              PRIMARY KEY (tool, key)
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS idx_perf_first ON perf_samples(first_ms) WHERE first_ms IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS perf_cursors (
+              source TEXT PRIMARY KEY,
+              size INTEGER NOT NULL,
+              identity INTEGER NOT NULL DEFAULT 0
+            );
+            """) && setUserVersion(5)
+            if !(ok && sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK) {
+                rollbackOrPoison()
+                setUserVersion(previousVersion)
+            }
+        }
+        // v6: DeepSeek balance history. Its API has no spend history for
+        // API-key logins, so the burn rate comes from how the balance falls.
+        if previousVersion < 6 {
+            guard let db else { return }
+            guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return }
+            let ok = execChecked("""
+            CREATE TABLE IF NOT EXISTS deepseek_balance_samples (
+              ts INTEGER NOT NULL,
+              currency TEXT NOT NULL,
+              amount REAL NOT NULL,
+              PRIMARY KEY (ts, currency)
+            ) WITHOUT ROWID;
+            """) && setUserVersion(6)
+            if !(ok && sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK) {
+                rollbackOrPoison()
+                setUserVersion(previousVersion)
+            }
+        }
     }
+
+    /// The user_version the last migration step sets.
+    static let schemaVersion: Int32 = 6
 
     private func userVersion() -> Int32 {
         guard let db else { return 0 }
@@ -617,7 +666,7 @@ final class Database: @unchecked Sendable {
 
     /// Inserts turn rows. Duplicates are ignored (by event_id when present,
     /// otherwise by the legacy compound key). Transaction-aware: joins an
-    /// outer `inTransaction` instead of committing independently (P0-2).
+    /// outer `inTransaction` instead of committing independently.
     /// Returns false when the write failed (caller should roll back).
     @discardableResult
     func insertTurns(_ turns: [TurnRecord]) -> Bool {
@@ -710,7 +759,7 @@ final class Database: @unchecked Sendable {
     }
 
     /// Runs a body inside one transaction. When the body returns false the
-    /// transaction is rolled back and no cursor/watermark may advance (P0-2).
+    /// transaction is rolled back and no cursor/watermark may advance.
     /// Nested calls (body invoking inTransaction again) join the outer
     /// transaction instead of starting a second one.
     func inTransaction(_ body: () -> Bool) -> Bool {
@@ -832,7 +881,7 @@ final class Database: @unchecked Sendable {
     func sessionTotals() -> [String: (tool: String, input: Int64, output: Int64, reasoning: Int64, cacheRead: Int64, cacheWrite: Int64, cost: Double)] {
         lock.lock(); defer { lock.unlock() }
         guard let db else { return [:] }
-        // M6: session_totals is read on every foreground scan (1s); a heavy
+        // session_totals is read on every foreground scan (1s); a heavy
         // user can have tens of thousands of rows. Cache by dataVersionKey —
         // writers invalidate explicitly, so the cache always matches the
         // committed rows.
@@ -884,7 +933,7 @@ final class Database: @unchecked Sendable {
         let rc = sqlite3_step(stmt)
         sqlite3_finalize(stmt)
         if rc != SQLITE_DONE { markTransactionWriteFailure(); return false }
-        // Invalidate the totals cache (M6): this write is not yet reflected
+        // Invalidate the totals cache: this write is not yet reflected
         // in dataVersionKey until the surrounding transaction commits, so the
         // writer must drop the cached rows explicitly.
         totalsCache = nil
@@ -986,10 +1035,8 @@ final class Database: @unchecked Sendable {
     /// Reads the full settings table into the in-memory cache once, at the
     /// end of openLocked (fresh install and restore alike). Caller must
     /// already hold `lock` (openLocked's caller does) and `db` must be open.
-    /// A NULL `v` row is skipped rather than cached as a present empty
-    /// value, matching the old direct-SQL reader's behavior: `sqlite3_
-    /// column_text` on a NULL column yields no C string, so the old code
-    /// left `out` as nil for that row.
+    /// A NULL `v` row is skipped, so `setting()` returns nil for it rather
+    /// than an empty string.
     private func loadSettingsCache() {
         guard let db else { return }
         var stmt: OpaquePointer?
@@ -1363,7 +1410,7 @@ final class Database: @unchecked Sendable {
         return out
     }
 
-    /// Deletes quota-snapshot rows older than 400 days (DB-7 retention), so a
+    /// Deletes quota-snapshot rows older than 400 days, so a
     /// long-running poller cannot grow the tables without bound. Internal so
     /// tests can drive the DELETE deterministically; the insert paths throttle
     /// it to once per hour via the `snapshot_prune_last` setting.
@@ -1371,7 +1418,7 @@ final class Database: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         guard let db else { return }
         let cutoff = now - 400 * 86400
-        for table in ["openrouter_snapshots", "opencodego_snapshots"] {
+        for table in ["openrouter_snapshots", "opencodego_snapshots", "deepseek_balance_samples"] {
             var stmt: OpaquePointer?
             let sql = "DELETE FROM \(table) WHERE ts < ?;"
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { continue }
@@ -1391,7 +1438,7 @@ final class Database: @unchecked Sendable {
         _ = setSetting("snapshot_prune_last", "\(now)")
     }
 
-    /// Weekly WAL checkpoint + VACUUM (L1). Deletes/updates (clearAllData,
+    /// Weekly WAL checkpoint + VACUUM. Deletes/updates (clearAllData,
     /// snapshot prune, resetLocalUsage) never shrink the SQLite file, so a
     /// long-running store grows unbounded. Gated weekly AND on file size so
     /// small stores skip the work entirely. Caller must hold the lock; it is
@@ -1729,7 +1776,7 @@ final class Database: @unchecked Sendable {
     struct Subscription: Identifiable, Equatable, Sendable {
         let id: Int64
         var name: String
-        var plan: String      // "" | "go" | "openrouter" | "claude"
+        var plan: String      // "" | "go" | "openrouter" | "claude" | "openai" | "grok"
         var startDate: Int64  // unix seconds
         var endDate: Int64 = 0 // 0 = active; unix seconds when it ended/stops
         var cycle: String     // "monthly" | "yearly"
@@ -1776,7 +1823,7 @@ final class Database: @unchecked Sendable {
         }
         var stmt: OpaquePointer?
         if s.id == 0 {
-            // New record: let SQLite assign the id (P0-9).
+            // New record: let SQLite assign the id.
             let sql = "INSERT INTO subscriptions (name, plan, start_date, end_date, cycle, price, currency) VALUES (?,?,?,?,?,?,?);"
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { markTransactionWriteFailure(); return false }
             sqlite3_bind_text(stmt, 1, (s.name as NSString).utf8String, -1, SQLITE_TRANSIENT)
@@ -1839,6 +1886,76 @@ final class Database: @unchecked Sendable {
     /// the most recent snapshot with ts < start (any day — on the first day of
     /// a cycle there may be no same-day snapshot yet); when none exists the
     /// baseline is 0.
+    /// Account-level OpenRouter credit used (cumulative): the oldest and the
+    /// newest reading since `start`. Covers spend from every key, unlike
+    /// `usage_daily`; a cumulative counter only needs its two ends.
+    func orCreditUsage(since start: Int64) -> [(ts: Int64, value: Double)] {
+        lock.lock(); defer { lock.unlock() }
+        guard let db else { return [] }
+        var stmt: OpaquePointer?
+        let sql = """
+        SELECT ts, credits_usage FROM (
+          SELECT ts, credits_usage FROM (SELECT ts, credits_usage FROM openrouter_snapshots
+            WHERE ts >= ?1 AND credits_usage IS NOT NULL ORDER BY ts ASC LIMIT 1)
+          UNION
+          SELECT ts, credits_usage FROM (SELECT ts, credits_usage FROM openrouter_snapshots
+            WHERE ts >= ?1 AND credits_usage IS NOT NULL ORDER BY ts DESC LIMIT 1)
+        ) ORDER BY ts;
+        """
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        sqlite3_bind_int64(stmt, 1, start)
+        var out: [(ts: Int64, value: Double)] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            out.append((sqlite3_column_int64(stmt, 0), sqlite3_column_double(stmt, 1)))
+        }
+        sqlite3_finalize(stmt)
+        return out
+    }
+
+    /// Records a DeepSeek balance reading. Unchanged readings are stored at
+    /// most every 10 minutes; that is enough to measure how time passes.
+    func insertDeepSeekBalance(currency: String, amount: Double, ts: Int64 = Int64(Date().timeIntervalSince1970)) {
+        lock.lock(); defer { lock.unlock() }
+        guard let db, amount.isFinite else { return }
+        var stmt: OpaquePointer?
+        let lastSQL = "SELECT ts, amount FROM deepseek_balance_samples WHERE currency = ? ORDER BY ts DESC LIMIT 1;"
+        if sqlite3_prepare_v2(db, lastSQL, -1, &stmt, nil) == SQLITE_OK {
+            sqlite3_bind_text(stmt, 1, (currency as NSString).utf8String, -1, SQLITE_TRANSIENT)
+            if sqlite3_step(stmt) == SQLITE_ROW,
+               ts - sqlite3_column_int64(stmt, 0) < 600,
+               sqlite3_column_double(stmt, 1) == amount {
+                sqlite3_finalize(stmt)
+                return
+            }
+            sqlite3_finalize(stmt)
+        }
+        let sql = "INSERT OR REPLACE INTO deepseek_balance_samples (ts, currency, amount) VALUES (?,?,?);"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { markTransactionWriteFailure(); return }
+        sqlite3_bind_int64(stmt, 1, ts)
+        sqlite3_bind_text(stmt, 2, (currency as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_double(stmt, 3, amount)
+        if sqlite3_step(stmt) != SQLITE_DONE { markTransactionWriteFailure() }
+        sqlite3_finalize(stmt)
+        pruneSnapshotsIfDue()
+    }
+
+    /// DeepSeek balance readings in `currency` since `start`, oldest first.
+    func deepSeekBalances(currency: String, since start: Int64) -> [(ts: Int64, value: Double)] {
+        lock.lock(); defer { lock.unlock() }
+        guard let db else { return [] }
+        var stmt: OpaquePointer?
+        let sql = "SELECT ts, amount FROM deepseek_balance_samples WHERE currency = ? AND ts >= ? ORDER BY ts;"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        sqlite3_bind_text(stmt, 1, (currency as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int64(stmt, 2, start)
+        var out: [(ts: Int64, value: Double)] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            out.append((sqlite3_column_int64(stmt, 0), sqlite3_column_double(stmt, 1)))
+        }
+        sqlite3_finalize(stmt)
+        return out
+    }
+
     func orSpendSince(_ start: Int64) -> Double {
         lock.lock(); defer { lock.unlock() }
         guard let db else { return 0 }
@@ -1895,7 +2012,7 @@ final class Database: @unchecked Sendable {
         return out
     }
 
-    /// Cost breakdown by quality (spec §5.2): estimated vs actual variable
+    /// Cost breakdown by quality: estimated vs actual variable
     /// spend. Hermes is excluded because its traffic is billed inside
     /// OCG/OpenRouter/Codex plans.
     func costBreakdown(from: Int64, to: Int64) -> (estimated: Double, actual: Double, deepseekActual: Double) {
@@ -1923,8 +2040,8 @@ final class Database: @unchecked Sendable {
         return out
     }
 
-    /// API 价值：全部工具（含 hermes）的所有 turns 按模型官方单价重估。
-    /// 与实际账单无关——回答「这些 token 按 API 价值多少钱」。
+    /// API value: every tool's turns (Hermes included) repriced at list
+    /// prices. Unrelated to actual billing.
     ///
     /// Pricing.estimate is a per-token linear function of (input, output,
     /// cacheRead, cacheWrite) that depends only on `model` — summing tokens
@@ -2028,7 +2145,7 @@ final class Database: @unchecked Sendable {
             var ok = true
             for spec in tools {
                 let raw = spec.tool.rawValue
-                for table in ["turns", "sessions", "session_totals"] {
+                for table in ["turns", "sessions", "session_totals", "perf_samples"] {
                     var stmt: OpaquePointer?
                     let sql = "DELETE FROM \(table) WHERE tool=?;"
                     if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) != SQLITE_OK {
@@ -2044,24 +2161,26 @@ final class Database: @unchecked Sendable {
                     sqlite3_finalize(stmt)
                 }
                 for root in spec.roots {
-                    var stmt: OpaquePointer?
-                    let sql = "DELETE FROM scan_state WHERE substr(source,1,length(?))=?;"
-                    if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) != SQLITE_OK {
-                        ok = false
-                        markTransactionWriteFailure()
-                    } else {
-                        sqlite3_bind_text(stmt, 1, (root as NSString).utf8String, -1, SQLITE_TRANSIENT)
-                        sqlite3_bind_text(stmt, 2, (root as NSString).utf8String, -1, SQLITE_TRANSIENT)
-                        if sqlite3_step(stmt) != SQLITE_DONE {
+                    for cursorTable in ["scan_state", "perf_cursors"] {
+                        var stmt: OpaquePointer?
+                        let sql = "DELETE FROM \(cursorTable) WHERE substr(source,1,length(?))=?;"
+                        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) != SQLITE_OK {
                             ok = false
                             markTransactionWriteFailure()
+                        } else {
+                            sqlite3_bind_text(stmt, 1, (root as NSString).utf8String, -1, SQLITE_TRANSIENT)
+                            sqlite3_bind_text(stmt, 2, (root as NSString).utf8String, -1, SQLITE_TRANSIENT)
+                            if sqlite3_step(stmt) != SQLITE_DONE {
+                                ok = false
+                                markTransactionWriteFailure()
+                            }
                         }
+                        sqlite3_finalize(stmt)
                     }
-                    sqlite3_finalize(stmt)
                 }
             }
             // Deletes do not grow MAX(id); bump the version stamp so the
-            // snapshot cache invalidates after a local rebuild (DB-1).
+            // snapshot cache invalidates after a local rebuild.
             if ok {
                 scanStatesCache = nil
                 bumpDataVersion()
@@ -2081,9 +2200,10 @@ final class Database: @unchecked Sendable {
         let tables = [
             "turns", "sessions", "scan_state", "session_totals",
             "openrouter_snapshots", "opencodego_snapshots", "subscriptions",
-            "claude_quota_samples",
+            "claude_quota_samples", "perf_samples", "perf_cursors",
+            "deepseek_balance_samples",
             // Resets the AUTOINCREMENT counters for turns/subscriptions so
-            // re-imported ids start from 1 again (DB-4 housekeeping).
+            // re-imported ids start from 1 again.
             "sqlite_sequence"
         ]
         for table in tables {
@@ -2206,7 +2326,7 @@ final class Database: @unchecked Sendable {
         let version = candidate.userVersion()
         let tablesExist = Self.restoreTables.allSatisfy { !candidate.columnTypes(in: $0).isEmpty }
         candidate.close()
-        guard (0...4).contains(version), tablesExist else {
+        guard (0...Self.schemaVersion).contains(version), tablesExist else {
             NSLog("[ToastMonitor] restore source rejected: schema=%d tables=%d", version, tablesExist)
             return false
         }
@@ -2257,7 +2377,7 @@ final class Database: @unchecked Sendable {
     }
 
     private func isUsable(comparedTo reference: Database) -> Bool {
-        guard db != nil, !startupHadError, userVersion() == 4 else {
+        guard db != nil, !startupHadError, userVersion() == Self.schemaVersion else {
             NSLog("[ToastMonitor] restore readiness failed: open=%d startupError=%d schema=%d", db != nil, startupHadError, userVersion())
             return false
         }
@@ -2417,13 +2537,13 @@ final class Database: @unchecked Sendable {
         return max(out, beat)
     }
 
-    /// 轻量数据版本戳：任何会改变快照的写路径（turns / 额度快照 / 订阅 /
-    /// 有效扫描 heartbeat）都会反映在计数与最大时间戳上。快照缓存用它
-    /// 判断是否需要重算——版本未变时直接复用上次聚合结果。
-    /// 包含当日本地日期：跨午夜后"今日"窗口必须滚动。
-    /// turns 用 MAX(id)（O(1) b-tree 尾）而不是 COUNT(*)：插入总是增长
-    /// MAX(id)，而删除路径不增长 —— clearAllData/resetLocalUsage/restore
-    /// 必须显式 bump `data_version`，否则清空后键不变化、缓存不失效。
+    /// Cheap data-version stamp: every write that changes a snapshot (turns,
+    /// quota snapshots, subscriptions, scan heartbeat) shows up in a count or
+    /// max timestamp, so snapshot caches recompute only when it changes.
+    /// Includes the local date so "today" rolls over at midnight.
+    /// turns uses MAX(id) (O(1)) rather than COUNT(*): inserts grow it but
+    /// deletes do not, so clearAllData/resetLocalUsage/restore must bump
+    /// `data_version` explicitly.
     func dataVersionKey() -> String {
         lock.lock(); defer { lock.unlock() }
         guard let db else { return "closed" }
@@ -2447,8 +2567,8 @@ final class Database: @unchecked Sendable {
         return out
     }
 
-    /// 订阅写路径的修改计数（UPDATE 不改变 COUNT/MAX(id)，需要显式 bump，
-    /// 否则快照缓存会命中旧值）。
+    /// Bumps `data_version` for writes that change neither COUNT nor MAX(id)
+    /// (updates, deletes), so snapshot caches invalidate.
     private func bumpDataVersion() {
         guard let db else { return }
         var stmt: OpaquePointer?
@@ -2663,6 +2783,136 @@ final class Database: @unchecked Sendable {
         let hi = floorBucket(to + 1)
         guard useRollup, lo < hi else { return (to + 1, to + 1) }
         return (lo, hi)
+    }
+
+    // MARK: - Performance samples
+
+    /// Merges samples into perf_samples: the first non-null request/first-token
+    /// time wins, the last-token time and token count only grow.
+    @discardableResult
+    func upsertPerfSamples(_ samples: [PerfSample]) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !samples.isEmpty else { return true }
+        guard let db else { return false }
+        let sql = """
+        INSERT INTO perf_samples (tool, key, model, request_ms, first_ms, last_ms, output_tokens)
+        VALUES (?,?,?,?,?,?,?)
+        ON CONFLICT(tool, key) DO UPDATE SET
+          model = COALESCE(model, excluded.model),
+          request_ms = COALESCE(request_ms, excluded.request_ms),
+          first_ms = COALESCE(first_ms, excluded.first_ms),
+          last_ms = CASE WHEN last_ms IS NULL THEN excluded.last_ms
+                         WHEN excluded.last_ms IS NULL THEN last_ms
+                         ELSE MAX(last_ms, excluded.last_ms) END,
+          output_tokens = MAX(output_tokens, excluded.output_tokens);
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            markTransactionWriteFailure()
+            return false
+        }
+        defer { sqlite3_finalize(stmt) }
+        func bind(_ index: Int32, _ value: Int64?) {
+            if let value { sqlite3_bind_int64(stmt, index, value) } else { sqlite3_bind_null(stmt, index) }
+        }
+        var ok = true
+        for s in samples {
+            sqlite3_bind_text(stmt, 1, (s.tool.rawValue as NSString).utf8String, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(stmt, 2, (s.key as NSString).utf8String, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(stmt, 3, (s.model as NSString?)?.utf8String ?? nil, -1, SQLITE_TRANSIENT)
+            bind(4, s.requestMs)
+            bind(5, s.firstTokenMs)
+            bind(6, s.lastMs)
+            sqlite3_bind_int64(stmt, 7, s.outputTokens)
+            if sqlite3_step(stmt) != SQLITE_DONE {
+                ok = false
+                markTransactionWriteFailure()
+            }
+            sqlite3_reset(stmt)
+            sqlite3_clear_bindings(stmt)
+        }
+        return ok
+    }
+
+    /// Calls whose first token was never seen (no streamed timing) can never
+    /// become measurable once their response has been fully read.
+    func pruneIncompletePerfSamples(before cutoffMs: Int64) {
+        lock.lock(); defer { lock.unlock() }
+        guard let db else { return }
+        var stmt: OpaquePointer?
+        let sql = "DELETE FROM perf_samples WHERE first_ms IS NULL AND COALESCE(last_ms, request_ms, 0) < ?;"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        sqlite3_bind_int64(stmt, 1, cutoffMs)
+        sqlite3_step(stmt)
+        sqlite3_finalize(stmt)
+    }
+
+    func perfCursor(_ source: String) -> (size: Int64, identity: Int64)? {
+        lock.lock(); defer { lock.unlock() }
+        guard let db else { return nil }
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT size, identity FROM perf_cursors WHERE source=?;", -1, &stmt, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, (source as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
+        return (sqlite3_column_int64(stmt, 0), sqlite3_column_int64(stmt, 1))
+    }
+
+    @discardableResult
+    func setPerfCursor(_ source: String, size: Int64, identity: Int64) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard let db else { return false }
+        var stmt: OpaquePointer?
+        let sql = "INSERT INTO perf_cursors (source, size, identity) VALUES (?,?,?) ON CONFLICT(source) DO UPDATE SET size=excluded.size, identity=excluded.identity;"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            markTransactionWriteFailure()
+            return false
+        }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, (source as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int64(stmt, 2, size)
+        sqlite3_bind_int64(stmt, 3, identity)
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            markTransactionWriteFailure()
+            return false
+        }
+        return true
+    }
+
+    /// Measured calls of the last `days` days. Time to first token needs the
+    /// request time; speed needs enough output to outweigh timing granularity.
+    func perfPoints(days: Int) -> [PerfPoint] {
+        lock.lock(); defer { lock.unlock() }
+        guard let db else { return [] }
+        let sinceMs = startOfDay(daysAgo: max(days - 1, 0)) * 1000
+        let sql = """
+        SELECT CAST(strftime('%Y%m%d', first_ms / 1000, 'unixepoch', 'localtime') AS INTEGER),
+               tool, COALESCE(NULLIF(model, ''), '(unknown)'),
+               CASE WHEN request_ms IS NOT NULL AND first_ms > request_ms
+                         AND first_ms - request_ms < 300000
+                    THEN first_ms - request_ms END,
+               CASE WHEN output_tokens >= ? AND last_ms - first_ms >= ?
+                    THEN output_tokens * 1000.0 / (last_ms - first_ms) END
+        FROM perf_samples
+        WHERE first_ms >= ? AND COALESCE(model, '') <> '<synthetic>';
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, PerfStats.minOutputTokens)
+        sqlite3_bind_int64(stmt, 2, PerfStats.minGenerationMs)
+        sqlite3_bind_int64(stmt, 3, sinceMs)
+        var out: [PerfPoint] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let ttft = sqlite3_column_type(stmt, 3) == SQLITE_NULL ? nil : sqlite3_column_double(stmt, 3)
+            let tps = sqlite3_column_type(stmt, 4) == SQLITE_NULL ? nil : sqlite3_column_double(stmt, 4)
+            guard ttft != nil || tps != nil else { continue }
+            out.append(PerfPoint(day: sqlite3_column_int64(stmt, 0),
+                                 tool: String(cString: sqlite3_column_text(stmt, 1)),
+                                 model: String(cString: sqlite3_column_text(stmt, 2)),
+                                 ttftMs: ttft, tokensPerSecond: tps))
+        }
+        return out
     }
 
     private func bindUsageRange(_ stmt: OpaquePointer?, from: Int64, to: Int64) {

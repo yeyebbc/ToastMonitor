@@ -2,8 +2,6 @@ import AppKit
 import Charts
 import SwiftUI
 
-/// 用量分析 (spec §3.2): 集中控制条（日期范围 / 按工具·按模型 / 图型）+
-/// token 堆叠图 + 成本图（按天聚合，禁止跨工具连线）+ 聚合表。
 /// Analysis: one control bar (metric, range, grouping), summary figures, a
 /// per-day stacked bar chart and the aggregate table. Charts are Swift Charts,
 /// so axes, grid lines, VoiceOver and Audio Graphs are the system's.
@@ -49,9 +47,9 @@ struct UsageAnalysisView: View {
     /// distinct palette entries (hash-based mapping collided).
     @State private var modelColors: [String: Color] = [:]
 
-    // MARK: - Derived data（单次求值，仅数据到达时重建）
+    // MARK: - Derived data (rebuilt only when data arrives)
 
-    /// 归一化行：(day, groupKey, input, output, cacheRead, cost, calls)
+    /// Normalized row: (day, groupKey, input, output, cacheRead, cost, calls)
     private struct Row {
         let day: Int64
         let key: String
@@ -81,8 +79,8 @@ struct UsageAnalysisView: View {
         let color: Color
     }
 
-    /// 图表/表格的全部派生输入，在原始行上单遍聚合得到。只有新数据到达时
-    /// 才重建；切换 range/grouping 时旧值继续渲染，避免整页 loading 闪屏。
+    /// Every derived chart/table input, built in one pass over the raw rows
+    /// when data arrives; old values keep rendering while range/grouping change.
     private struct AnalysisData {
         let grouping: Grouping
         let range: Range
@@ -94,6 +92,8 @@ struct UsageAnalysisView: View {
         let labels: [String]
         let colors: [Color]
         let aggregates: [AggregateRow]
+        /// What the CSV export writes: raw ids, not merged display names.
+        let csvRows: [AnalysisCSVRow]
         let dayCount: Int
         let totalTokens: Int64
         let totalCost: Double
@@ -169,7 +169,7 @@ struct UsageAnalysisView: View {
         panel.canCreateDirectories = true
         guard panel.runModal() == .OK, let url = panel.url else { return }
         var lines = ["range,grouping,name,tokens,calls,estimated_cost,share"]
-        for row in analysis.aggregates {
+        for row in analysis.csvRows {
             lines.append([
                 analysis.range.rawValue,
                 analysis.grouping.rawValue,
@@ -239,7 +239,7 @@ struct UsageAnalysisView: View {
     /// palette color — the top model gets the first color, no collisions.
     private static func assignModelColors(_ aggs: [(day: Int64, model: String, input: Int64, output: Int64, cacheRead: Int64, cost: Double, count: Int64)]) -> [String: Color] {
         let totals: [String: Int64] = aggs.reduce(into: [:]) { acc, row in
-            acc[row.model, default: 0] += row.input + row.output + row.cacheRead
+            acc[ModelName.display(row.model), default: 0] += row.input + row.output + row.cacheRead
         }
         let ranked = totals.sorted { $0.value > $1.value }.map(\.key)
         var map: [String: Color] = [:]
@@ -286,8 +286,8 @@ struct UsageAnalysisView: View {
         return Int64((c.year ?? 0) * 10_000 + (c.month ?? 0) * 100 + (c.day ?? 0))
     }
 
-    /// 单遍聚合：day × name token 和、按名称聚合、按天成本，一次算出
-    /// 图表与表格的全部输入。
+    /// One pass: per-day × name token sums, per-name totals and per-day cost —
+    /// every chart and table input.
     private static func build(aggs: [Database.DayAgg],
                               modelAggs: [(day: Int64, model: String, input: Int64, output: Int64, cacheRead: Int64, cost: Double, count: Int64)],
                               grouping: Grouping,
@@ -295,7 +295,7 @@ struct UsageAnalysisView: View {
                               modelColors: [String: Color]) -> AnalysisData {
         let rows: [Row] = grouping == .byTool
             ? aggs.map { Row(day: $0.day, key: $0.tool, input: $0.input, output: $0.output, cacheRead: $0.cacheRead, cost: $0.cost, count: $0.count) }
-            : modelAggs.map { Row(day: $0.day, key: $0.model, input: $0.input, output: $0.output, cacheRead: $0.cacheRead, cost: $0.cost, count: $0.count) }
+            : modelAggs.map { Row(day: $0.day, key: ModelName.display($0.model), input: $0.input, output: $0.output, cacheRead: $0.cacheRead, cost: $0.cost, count: $0.count) }
 
         var dayTokens: [Int64: [String: Int64]] = [:]
         var dayCost: [Int64: [String: Double]] = [:]
@@ -336,6 +336,21 @@ struct UsageAnalysisView: View {
             }
         }
 
+        // CSV keeps the raw ids, one row per id, so an export can be matched
+        // back to the logs and the price table.
+        let csvRows: [AnalysisCSVRow]
+        if grouping == .byTool {
+            csvRows = orderedNames.compactMap { name in
+                let tokens = tokensByName[name] ?? 0
+                guard tokens > 0 else { return nil }
+                return AnalysisCSVRow(name: name, tokens: tokens, calls: callsByName[name] ?? 0,
+                                      cost: costByName[name] ?? 0,
+                                      ratio: totalTokens > 0 ? Double(tokens) / Double(totalTokens) : 0)
+            }
+        } else {
+            csvRows = AnalysisCSVRow.perModelID(modelAggs)
+        }
+
         let aggregates: [AggregateRow] = orderedNames.compactMap { name in
             let tokens = tokensByName[name] ?? 0
             guard tokens > 0 else { return nil }
@@ -361,6 +376,7 @@ struct UsageAnalysisView: View {
                             labels: aggregates.map { label($0.name) },
                             colors: aggregates.map(\.color),
                             aggregates: aggregates,
+                            csvRows: csvRows,
                             dayCount: dayOrder.count,
                             totalTokens: totalTokens,
                             totalCost: costByName.values.reduce(0, +),
@@ -382,12 +398,12 @@ struct UsageAnalysisView: View {
         if grouping == .byTool {
             return ToolKind(rawValue: name)?.color ?? TMDesign.accent
         }
-        // 模型色：按用量排名预分配（assignModelColors），同一模型在
-        // 图表/图例/表格里永远同色；新出现的模型兜底第一个色。
+        // Model colors are pre-assigned by usage rank (assignModelColors), so a
+        // model has one color everywhere; a newly seen model gets the first.
         return modelColors[name] ?? TMDesign.modelPalette[0]
     }
 
-    /// 当前展示数据的分组（切换期间旧数据渲染时跟随旧分组，保持标签一致）。
+    /// Grouping of the data on screen (follows the old grouping until new data lands).
     private var displayGrouping: Grouping {
         analysis?.grouping ?? grouping
     }
@@ -398,7 +414,7 @@ struct UsageAnalysisView: View {
             : name
     }
 
-    // MARK: - Chart（按天堆叠；token 与成本共用一张图）
+    // MARK: - Chart (stacked per day; tokens and cost share one chart)
 
     private func chart(_ data: AnalysisData) -> some View {
         let points = metric == .tokens ? data.tokenPoints : data.costPoints
@@ -535,7 +551,7 @@ struct UsageAnalysisView: View {
         .shadow(color: .black.opacity(0.18), radius: 8, y: 2)
     }
 
-    // MARK: - 聚合表
+    // MARK: - Aggregate table
 
     private var aggTable: some View {
         let rows = analysis?.aggregates ?? []
@@ -622,5 +638,34 @@ struct UsageAnalysisView: View {
                 }
             }
         }
+    }
+}
+
+/// One CSV line of the Analysis export.
+struct AnalysisCSVRow: Equatable {
+    let name: String
+    let tokens: Int64
+    let calls: Int64
+    let cost: Double
+    let ratio: Double
+
+    /// One row per raw model id (never merged by display name), most-used
+    /// first, so an export can be matched back to the logs and price table.
+    static func perModelID(
+        _ aggs: [(day: Int64, model: String, input: Int64, output: Int64, cacheRead: Int64, cost: Double, count: Int64)]
+    ) -> [AnalysisCSVRow] {
+        var tokens: [String: Int64] = [:], calls: [String: Int64] = [:], cost: [String: Double] = [:]
+        for m in aggs {
+            tokens[m.model, default: 0] += m.input + m.output + m.cacheRead
+            calls[m.model, default: 0] += max(m.count, 0)
+            cost[m.model, default: 0] += max(m.cost, 0)
+        }
+        let total = tokens.values.reduce(0, +)
+        return tokens.filter { $0.value > 0 }
+            .sorted { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }
+            .map { id, t in
+                AnalysisCSVRow(name: id, tokens: t, calls: calls[id] ?? 0, cost: cost[id] ?? 0,
+                               ratio: total > 0 ? Double(t) / Double(total) : 0)
+            }
     }
 }
