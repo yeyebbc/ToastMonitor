@@ -3,6 +3,16 @@ import Darwin
 
 /// Incremental JSONL utilities: tracks byte offsets so we only parse appended data.
 enum FileScanner {
+    /// Reject malformed counters before arithmetic, rather than after constructing a turn.
+    static func tokenCount(_ value: Any?) -> Int64 {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID(),
+              !["f", "d"].contains(String(cString: number.objCType)),
+              number.compare(NSNumber(value: 0)) != .orderedAscending,
+              number.compare(NSNumber(value: TurnRecord.maxTokens)) != .orderedDescending else { return 0 }
+        return number.int64Value
+    }
+
 
     private struct FileListCache {
         let files: [String]
@@ -278,9 +288,21 @@ enum FileScanner {
     }
 
     /// "…-Users-me-Projects-App" -> "App" (last path component, "-" = "/").
+    /// Hyphens inside a directory name are indistinguishable from the path
+    /// separator, so callers that have the real `cwd` should use `projectName`.
     static func lastComponentOfEncodedPath(_ s: String) -> String {
         let parts = s.split(separator: "-").map(String.init)
         guard let last = parts.last, !last.isEmpty else { return s }
         return last
+    }
+
+    /// Project label: the last path component of `cwd` when the transcript
+    /// recorded one, otherwise the encoded directory name.
+    static func projectName(cwd: String?, encodedDirectory: String) -> String {
+        if let cwd {
+            let last = (cwd as NSString).lastPathComponent
+            if !last.isEmpty && last != "/" && last != "." { return last }
+        }
+        return lastComponentOfEncodedPath(encodedDirectory)
     }
 }

@@ -23,7 +23,9 @@ final class GrokQuotaClient: ObservableObject {
     /// `grok login` writes one entry per scope; the OIDC scope is SuperGrok.
     nonisolated static let oidcScopePrefix = "https://auth.x.ai::"
     nonisolated static let legacySessionScope = "https://accounts.x.ai/sign-in"
+    static let enabledSettingKey = "grok_quota_enabled"
     static let notConfigured = "Grok login not found (run grok login)"
+    nonisolated static let expired = "Grok login expired — run grok once"
 
     struct ProductUsage: Equatable {
         let product: String
@@ -97,8 +99,35 @@ final class GrokQuotaClient: ObservableObject {
 
     // MARK: - Foreground-aware refresh
 
+    @Published private(set) var enabled = false
+    private var loadedPreference = false
+
+    /// Off until the user opts in. Enabling can run `grok` in the background
+    /// when the saved access token is expired.
+    func setEnabled(_ on: Bool) {
+        guard on != enabled else { return }
+        enabled = on
+        loadedPreference = true
+        DispatchQueue.global(qos: .utility).async {
+            _ = Database.shared.setSetting(Self.enabledSettingKey, on ? "1" : nil)
+        }
+        if on {
+            started = false
+            start()
+        } else {
+            started = false
+            poller.stop()
+            refreshGeneration &+= 1
+            inFlight = false
+        }
+    }
+
     func start() {
-        guard !started else { return }
+        if !loadedPreference {
+            enabled = Database.shared.setting(Self.enabledSettingKey) == "1"
+            loadedPreference = true
+        }
+        guard enabled, !started else { return }
         started = true
         refresh()
         poller.start { [weak self] in MainActor.assumeIsolated { self?.refresh() } }
@@ -107,7 +136,7 @@ final class GrokQuotaClient: ObservableObject {
     // MARK: - Refresh
 
     func refresh() {
-        guard !inFlight, !isDemo else { return }
+        guard enabled, !inFlight, !isDemo else { return }
         // Backoff gate: skip attempts inside the backoff window.
         if backoff.isWaiting { return }
         inFlight = true
@@ -116,7 +145,12 @@ final class GrokQuotaClient: ObservableObject {
 
         // Never read auth.json on the main actor.
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let credentials = Self.loadCredentials()
+            var credentials = Self.loadCredentials()
+            // The access token lasts about six hours; let the Grok CLI renew
+            // it from the refresh token instead of asking for a new login.
+            if let expiresAt = credentials?.expiresAt, expiresAt <= Date(), GrokCLIRefresher.refresh() {
+                credentials = Self.loadCredentials()
+            }
             Task { @MainActor [weak self] in
                 guard let self, self.refreshGeneration == generation else { return }
                 guard let credentials else {
@@ -130,7 +164,7 @@ final class GrokQuotaClient: ObservableObject {
                 if let expiresAt = credentials.expiresAt, expiresAt <= Date() {
                     self.inFlight = false
                     self.state.isLoading = false
-                    self.state.error = "Grok login expired — run grok login"
+                    self.state.error = Self.expired
                     return
                 }
                 self.requestUsage(token: credentials.accessToken, generation: generation)
@@ -236,12 +270,33 @@ final class GrokQuotaClient: ObservableObject {
                     snapshot.planName = plan
                 }
                 self.apply(snapshot)
+            case .failure(.status(let code))? where code == 401 || code == 403:
+                // Rejected before its expiry (revoked, or the clock is off):
+                // one CLI renewal, then a normal refresh with the new token.
+                self.state.error = Self.expired
+                self.renewAfterRejection()
             case .failure(let error)?:
                 self.state.error = Self.message(for: error)
                 self.backoff.failed()
             case nil:
                 self.state.error = "Grok billing request failed"
                 self.backoff.failed()
+            }
+        }
+    }
+
+    private func renewAfterRejection() {
+        inFlight = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let renewed = GrokCLIRefresher.refresh()
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.inFlight = false
+                if renewed {
+                    self.refresh()
+                } else {
+                    self.backoff.failed()
+                }
             }
         }
     }
@@ -268,7 +323,7 @@ final class GrokQuotaClient: ObservableObject {
             return "Redirect rejected (HTTP \(code))"
         case .status(let code):
             if code == 401 || code == 403 {
-                return "Grok login expired — run grok login"
+                return expired
             }
             return "Grok billing API HTTP \(code)"
         case .parse:

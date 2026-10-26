@@ -139,12 +139,12 @@ enum HermesParser {
                     let sid = String(cString: sqlite3_column_text(stmt, 0))
                     // Corrupt/partially migrated rows must never create
                     // negative token deltas downstream.
-                    let input = max(sqlite3_column_int64(stmt, 1), 0)
-                    let output = max(sqlite3_column_int64(stmt, 2), 0)
+                    let input = FileScanner.tokenCount(sqlite3_column_int64(stmt, 1))
+                    let output = FileScanner.tokenCount(sqlite3_column_int64(stmt, 2))
                     let ts = sqlite3_column_type(stmt, 3) == SQLITE_NULL ? 0 : sec(sqlite3_column_int64(stmt, 3))
                     var agg = perSession[sid] ?? (0, 0, 0)
-                    agg.input += input
-                    agg.output += output
+                    agg.input = min(agg.input + input, TurnRecord.maxTokens)
+                    agg.output = min(agg.output + output, TurnRecord.maxTokens)
                     if ts > agg.lastTs { agg.lastTs = ts }
                     perSession[sid] = agg
                 }
@@ -156,8 +156,8 @@ enum HermesParser {
                 let key = "hermes|\(sid)"
                 let prev = prevTotals[key]
                 if let prev {
-                    let dIn = max(agg.input - prev.input, 0)
-                    let dOut = max(agg.output - prev.output, 0)
+                    let dIn = max(agg.input - FileScanner.tokenCount(prev.input), 0)
+                    let dOut = max(agg.output - FileScanner.tokenCount(prev.output), 0)
                     if dIn > 0 || dOut > 0 {
                         turns.append(TurnRecord(tool: .hermes, sessionID: sid, project: nil, model: nil,
                                                 ts: agg.lastTs > 0 ? agg.lastTs : Int64(Date().timeIntervalSince1970),
@@ -213,22 +213,23 @@ enum HermesParser {
             return Int64(v > 1_000_000_000_000 ? v / 1000 : v)
         }
         var turns: [TurnRecord] = []
+        var totals = database.sessionTotals()
         while sqlite3_step(stmt) == SQLITE_ROW {
             guard let sid = text(0), !sid.isEmpty else { continue }
             let model = text(1)
             let provider = text(2)
             let current = HermesUsageBaseline.Counters(
-                input: max(sqlite3_column_int64(stmt, 4), 0),
-                output: max(sqlite3_column_int64(stmt, 5), 0),
-                reasoning: max(sqlite3_column_int64(stmt, 6), 0),
-                cacheRead: max(sqlite3_column_int64(stmt, 7), 0),
-                cacheWrite: max(sqlite3_column_int64(stmt, 8), 0))
+                input: FileScanner.tokenCount(sqlite3_column_int64(stmt, 4)),
+                output: FileScanner.tokenCount(sqlite3_column_int64(stmt, 5)),
+                reasoning: FileScanner.tokenCount(sqlite3_column_int64(stmt, 6)),
+                cacheRead: FileScanner.tokenCount(sqlite3_column_int64(stmt, 7)),
+                cacheWrite: FileScanner.tokenCount(sqlite3_column_int64(stmt, 8)))
             let lastSeen = seconds(10)
             let firstSeen = min(seconds(9), lastSeen)
             let key = HermesUsageBaseline.key(session: sid, model: model, provider: provider,
                                               baseURL: text(3))
             let localKey = HermesUsageBaseline.localTotalsKey(key)
-            let local: [Int64] = database.sessionTotals()[localKey].map { [$0.input, $0.output, $0.reasoning, $0.cacheRead, $0.cacheWrite, 0] } ?? []
+            let local: [Int64] = totals[localKey].map { [$0.input, $0.output, $0.reasoning, $0.cacheRead, $0.cacheWrite, 0] } ?? []
             let prev = HermesUsageBaseline.merge(current: current, baselines: [local,
                 HermesUsageBaseline.parse(database.setting(key))])
             let step = HermesUsageBaseline.advance(current: current, prev: prev)
@@ -252,10 +253,18 @@ enum HermesParser {
                                         costQuality: "unknown"))
             }
             let b = step.base
-            database.setSetting(key, HermesUsageBaseline.encode(b))
-            database.setSessionTotals(localKey, tool: "hermes", input: b.input, output: b.output,
-                                      reasoning: b.reasoning, cacheRead: b.cacheRead,
-                                      cacheWrite: b.cacheWrite, cost: 0, updated: lastSeen)
+            let encoded = HermesUsageBaseline.encode(b)
+            if database.setting(key) != encoded {
+                database.setSetting(key, encoded)
+            }
+            let stored = totals[localKey]
+            if stored?.input != b.input || stored?.output != b.output || stored?.reasoning != b.reasoning
+                || stored?.cacheRead != b.cacheRead || stored?.cacheWrite != b.cacheWrite {
+                database.setSessionTotals(localKey, tool: "hermes", input: b.input, output: b.output,
+                                          reasoning: b.reasoning, cacheRead: b.cacheRead,
+                                          cacheWrite: b.cacheWrite, cost: 0, updated: lastSeen)
+                totals[localKey] = ("hermes", b.input, b.output, b.reasoning, b.cacheRead, b.cacheWrite, 0)
+            }
         }
         return turns
     }
@@ -298,6 +307,14 @@ enum HermesUsageBaseline {
         var reasoning: Int64
         var cacheRead: Int64
         var cacheWrite: Int64
+
+        init(input: Int64, output: Int64, reasoning: Int64, cacheRead: Int64, cacheWrite: Int64) {
+            self.input = FileScanner.tokenCount(input)
+            self.output = FileScanner.tokenCount(output)
+            self.reasoning = FileScanner.tokenCount(reasoning)
+            self.cacheRead = FileScanner.tokenCount(cacheRead)
+            self.cacheWrite = FileScanner.tokenCount(cacheWrite)
+        }
     }
 
     /// Remote baselines live in settings under this key. base_url is
@@ -320,7 +337,8 @@ enum HermesUsageBaseline {
     }
 
     static func merge(current: Counters, baselines: [[Int64]]) -> [Int64] {
-        let normalized = baselines.compactMap { values -> [Int64]? in
+        let normalized = baselines.compactMap { raw -> [Int64]? in
+            let values = raw.map { FileScanner.tokenCount($0) }
             if values.count == 6 { return values }
             guard values.count == 5 else { return nil }
             let reasoning = min(current.reasoning, max(values[0], 0))
@@ -335,6 +353,7 @@ enum HermesUsageBaseline {
     /// `prev` is a stored baseline: 6 values, or the legacy 5 whose input
     /// included reasoning; anything else means the key was never seen.
     static func advance(current c: Counters, prev: [Int64]) -> (delta: Counters, base: Counters, isFirst: Bool) {
+        let prev = prev.map { FileScanner.tokenCount($0) }
         switch prev.count {
         case 6:
             let delta = Counters(input: max(c.input - prev[0], 0), output: max(c.output - prev[1], 0),

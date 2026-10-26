@@ -174,13 +174,6 @@ final class UsageQueryService: @unchecked Sendable {
         }
     }
 
-    func loadORSnapshots(limit: Int = 500, completion: @escaping @MainActor @Sendable ([Database.ORSnapshot]) -> Void) {
-        queue.async {
-            let snapshots = self.database.orSnapshots(limit: limit)
-            DispatchQueue.main.async { completion(snapshots) }
-        }
-    }
-
     func loadPerfPoints(days: Int, completion: @escaping @MainActor @Sendable ([PerfPoint]) -> Void) {
         queue.async {
             let points = self.database.perfPoints(days: days)
@@ -188,7 +181,7 @@ final class UsageQueryService: @unchecked Sendable {
         }
     }
 
-    func loadDailyAggsByModel(days: Int, completion: @escaping @MainActor @Sendable ([(day: Int64, model: String, input: Int64, output: Int64, cacheRead: Int64, cost: Double, count: Int64)]) -> Void) {
+    func loadDailyAggsByModel(days: Int, completion: @escaping @MainActor @Sendable ([(day: Int64, model: String, input: Int64, output: Int64, cacheRead: Int64, cost: Double, count: Int64, totalTokens: Int64)]) -> Void) {
         queue.async {
             let aggs = self.database.dailyAggregatesByModel(days: days)
             DispatchQueue.main.async { completion(aggs) }

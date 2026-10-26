@@ -50,16 +50,18 @@ enum ClaudeCLIRefresher {
     /// `fixedCandidates` covers the two common non-Homebrew-variable install
     /// roots; overridable so tests can run hermetically instead of picking
     /// up whatever happens to be installed on the machine running them.
-    nonisolated static func locateBinary(env: [String: String] = ProcessInfo.processInfo.environment,
+    nonisolated static func locateBinary(named name: String = "claude",
+                                         env: [String: String] = ProcessInfo.processInfo.environment,
                                          home: String = NSHomeDirectory(),
-                                         fixedCandidates: [String] = ["/opt/homebrew/bin/claude", "/usr/local/bin/claude"]) -> String? {
-        let candidates = ["\(home)/.local/bin/claude"] + fixedCandidates
+                                         fixedCandidates: [String]? = nil) -> String? {
+        let fixed = fixedCandidates ?? ["/opt/homebrew/bin/\(name)", "/usr/local/bin/\(name)"]
+        let candidates = ["\(home)/.local/bin/\(name)"] + fixed
         for path in candidates where FileManager.default.isExecutableFile(atPath: path) {
             return path
         }
         guard let pathVar = env["PATH"] else { return nil }
         for dir in pathVar.split(separator: ":") {
-            let candidate = "\(dir)/claude"
+            let candidate = "\(dir)/\(name)"
             if FileManager.default.isExecutableFile(atPath: candidate) { return candidate }
         }
         return nil
@@ -123,9 +125,9 @@ enum ClaudeCLIRefresher {
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: binary)
-        // Every tool disabled: even if something unexpected reached the
-        // model, it could not read, write, or run anything.
-        process.arguments = ["--allowed-tools", ""]
+        // `--tools ""` disables the tool list. The probe still uses the
+        // user's Claude login; CLAUDE_CONFIG_DIR is left unset on purpose.
+        process.arguments = ["--tools", ""]
         process.currentDirectoryURL = probeDir
         let slaveHandle = FileHandle(fileDescriptor: slaveFD, closeOnDealloc: false)
         process.standardInput = slaveHandle
@@ -148,7 +150,8 @@ enum ClaudeCLIRefresher {
         let deadline = Date().addingTimeInterval(probeTimeout)
         let commandSendTime = Date().addingTimeInterval(5) // let the UI settle first
         var sentCommand = false
-        var lastEnterSent = Date.distantPast
+        var nudgedAfterStatus = false
+        var scanFrom = 0
         var succeeded = false
 
         while Date() < deadline {
@@ -158,23 +161,22 @@ enum ClaudeCLIRefresher {
                 let n = read(masterFD, &chunk, chunk.count)
                 if n > 0 { buffer.append(contentsOf: chunk[0..<n]) }
             }
-            let tail = buffer.suffix(20_000)
-            let scan = compact(Array(tail))
+            let fresh = buffer.dropFirst(min(scanFrom, buffer.count))
+            let scan = compact(Array(fresh.suffix(20_000)))
             let now = Date()
 
-            if now.timeIntervalSince(lastEnterSent) > 0.8,
-               dismissPromptTokens.contains(where: scan.contains) {
+            if dismissPromptTokens.contains(where: scan.contains) {
                 writeToFD(masterFD, "\r")
-                lastEnterSent = now
+                scanFrom = buffer.count
             }
             if !sentCommand, now >= commandSendTime {
                 writeToFD(masterFD, "/status\r")
                 sentCommand = true
+                scanFrom = buffer.count
             }
-            if sentCommand, now.timeIntervalSince(lastEnterSent) > 0.8 {
-                // Some terminals need a nudge for the input to submit.
+            if sentCommand, !nudgedAfterStatus, now >= commandSendTime.addingTimeInterval(0.8) {
                 writeToFD(masterFD, "\r")
-                lastEnterSent = now
+                nudgedAfterStatus = true
             }
             if sentCommand, statusReadyTokens.contains(where: scan.contains) {
                 succeeded = true

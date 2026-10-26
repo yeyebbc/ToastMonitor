@@ -139,10 +139,9 @@ final class CodexParserJSONTests: XCTestCase {
 }
 
 
-/// PARSER-1: two token_count events in the same second with identical
-/// last_token_usage must still produce distinct event ids. The digest is
-/// anchored on the byte offset, otherwise ON CONFLICT DO NOTHING silently
-/// drops one of the turns.
+/// Two real turns in the same second with identical last_token_usage still
+/// need distinct event ids. A repeated snapshot of an unchanged
+/// total_token_usage is not one of those turns: the parser skips it.
 final class CodexEventIdentityTests: XCTestCase {
     func testSameSecondSameUsageDistinctOffsetsKeepBothTurns() {
         let usage: [String: Any] = [
@@ -166,6 +165,105 @@ final class CodexEventIdentityTests: XCTestCase {
                                                   usage: usage, offset: 1024))
         XCTAssertEqual(second, EventIdentity.codex(sessionID: sid, timestamp: ts, model: model,
                                                    usage: usage, offset: 3072))
+    }
+}
+
+/// total_token_usage is cumulative. A refresh that repeats it must not add
+/// another turn; growth is counted as the per-field delta.
+final class CodexTotalDeltaTests: XCTestCase {
+    private var db: Database!
+    private var dbPath = ""
+
+    override func setUp() {
+        super.setUp()
+        dbPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-delta-\(UUID().uuidString).sqlite").path
+        db = Database.testInstance(path: dbPath)
+    }
+
+    override func tearDown() {
+        db.close()
+        for suffix in ["", "-wal", "-shm"] {
+            try? FileManager.default.removeItem(atPath: dbPath + suffix)
+        }
+        super.tearDown()
+    }
+
+    private func write(_ body: String, name: String = "rollout-2026-08-04T09-22-33-019fcb70-2990-7ae3-897a-826135c6b1c5.jsonl") throws -> String {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-rollout-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let path = dir.appendingPathComponent(name)
+        try body.write(to: path, atomically: true, encoding: .utf8)
+        return path.path
+    }
+
+    func testUnchangedTotalIsOneTurn() throws {
+        let path = try write("""
+        {"timestamp":"2026-08-04T09:22:33Z","type":"session_meta","payload":{"session_id":"sid-1","cwd":"/Users/demo/app"}}
+        {"timestamp":"2026-08-04T09:22:34Z","type":"turn_context","payload":{"model":"gpt-5"}}
+        {"timestamp":"2026-08-04T09:22:35Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"output_tokens":10},"total_token_usage":{"input_tokens":100,"output_tokens":10}}}}
+        {"timestamp":"2026-08-04T09:22:36Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"output_tokens":10},"total_token_usage":{"input_tokens":100,"output_tokens":10}}}}
+        """)
+        let turns = CodexParser.scan(files: [path], database: db).turns
+        XCTAssertEqual(turns.count, 1)
+        XCTAssertEqual(turns[0].inputTokens, 100)
+        XCTAssertEqual(turns[0].outputTokens, 10)
+        XCTAssertEqual(turns[0].model, "gpt-5")
+    }
+
+    func testGrowingTotalCountsTheDelta() throws {
+        let path = try write("""
+        {"timestamp":"2026-08-04T09:22:34Z","type":"turn_context","payload":{"model":"gpt-5-mini"}}
+        {"timestamp":"2026-08-04T09:22:35Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"output_tokens":10,"cached_input_tokens":4},"total_token_usage":{"input_tokens":100,"output_tokens":10,"cached_input_tokens":4}}}}
+        {"timestamp":"2026-08-04T09:22:40Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":50,"output_tokens":15,"cached_input_tokens":6},"total_token_usage":{"input_tokens":150,"output_tokens":25,"cached_input_tokens":10}}}}
+        """)
+        let turns = CodexParser.scan(files: [path], database: db).turns
+        XCTAssertEqual(turns.map(\.inputTokens), [100, 50])
+        XCTAssertEqual(turns.map(\.outputTokens), [10, 15])
+        XCTAssertEqual(turns.map(\.cacheRead), [4, 6])
+        XCTAssertEqual(turns[0].model, "gpt-5-mini")
+        // Codex input already includes cache, so the 6 cached tokens are not billed again at the input rate.
+        let billableInput = 50.0 - 6.0
+        XCTAssertEqual(turns[1].cost, billableInput / 1e6 * 0.25 + 15.0 / 1e6 * 2 + 6.0 / 1e6 * 0.025, accuracy: 0.0000001)
+    }
+
+    func testSameLastUsageWithALargerTotalKeepsBothTurns() throws {
+        let path = try write("""
+        {"timestamp":"2026-08-04T09:22:35Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":1},"total_token_usage":{"input_tokens":10,"output_tokens":1}}}}
+        {"timestamp":"2026-08-04T09:22:35Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":1},"total_token_usage":{"input_tokens":20,"output_tokens":2}}}}
+        """)
+        let turns = CodexParser.scan(files: [path], database: db).turns
+        XCTAssertEqual(turns.count, 2)
+        XCTAssertEqual(turns.map(\.inputTokens), [10, 10])
+        XCTAssertNotEqual(turns[0].eventID, turns[1].eventID)
+    }
+
+    func testAppendedRepeatOfTheSameTotalDoesNotInsertAgain() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-append-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appendingPathComponent("rollout-2026-08-04T09-22-33-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl").path
+        let first = #"{"timestamp":"2026-08-04T09:22:35Z","type":"session_meta","payload":{"session_id":"sid-append"}}"#
+            + "\n"
+            + #"{"timestamp":"2026-08-04T09:22:36Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":40,"output_tokens":4},"total_token_usage":{"input_tokens":40,"output_tokens":4}}}}"#
+            + "\n"
+        try first.write(toFile: path, atomically: true, encoding: .utf8)
+        let scanned = CodexParser.scan(files: [path], database: db).turns
+        XCTAssertEqual(scanned.count, 1)
+        XCTAssertTrue(db.insertTurns(scanned))
+
+        let repeatLine = #"{"timestamp":"2026-08-04T09:22:50Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":40,"output_tokens":4},"total_token_usage":{"input_tokens":40,"output_tokens":4}}}}"#
+        let fh = try XCTUnwrap(FileHandle(forWritingAtPath: path))
+        fh.seekToEndOfFile()
+        fh.write(Data((repeatLine + "\n").utf8))
+        fh.closeFile()
+
+        let again = CodexParser.scan(files: [path], database: db).turns
+        XCTAssertTrue(again.isEmpty)
+        XCTAssertTrue(db.insertTurns(again))
+        XCTAssertEqual(db.turns(sessionTool: "codex", sessionID: "sid-append").count, 1)
     }
 }
 
@@ -269,7 +367,7 @@ final class OpenCodeParserDeltaTests: XCTestCase {
         XCTAssertEqual(third[0].cost, 2.5, accuracy: 0.0001, "7.5 - max(5.0, 2.0) = 2.5, not 5.5")
     }
 
-    func testLegacyCombinedInputTransitionProducesNoDeltaAndRaisesBaseline() {
+    func testLegacyCombinedInputTransitionAdoptsSplitBaseline() {
         // Older opencode versions folded reasoning into input: the baseline
         // is input = 1000 (combined), reasoning = 0.
         writeRow(cost: 5.0, input: 1000, output: 500, timeUpdated: 1786628700000)
@@ -280,11 +378,11 @@ final class OpenCodeParserDeltaTests: XCTestCase {
         let (transition, _) = OpenCodeParser.scan(database: db)
         XCTAssertTrue(transition.isEmpty, "re-labeling input → reasoning is not new usage")
 
-        // Later growth is measured from the max baseline (input 1000).
+        // Later growth is measured from the migrated split baseline (input 900).
         writeRow(cost: 6.0, input: 1200, output: 500, reasoning: 150, timeUpdated: 1786628900000)
         let (grown, _) = OpenCodeParser.scan(database: db)
         XCTAssertEqual(grown.count, 1)
-        XCTAssertEqual(grown[0].inputTokens, 200)
+        XCTAssertEqual(grown[0].inputTokens, 300)
         XCTAssertEqual(grown[0].reasoningTokens, 50, "150 - max(0, 100) = 50")
     }
 }
