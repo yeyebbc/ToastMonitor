@@ -25,7 +25,7 @@ UI verification:
   --render-settings PATH [general|appearance|sources|data|updates] [HEIGHT]
   --show-panel [--backdrop white|dark] [--appearance light|dark] [--demo] [--capture PATH]
                                      --demo: made-up data; needs TM_DATABASE_PATH
-  --show-dashboard [--appearance light|dark] [--demo] [--capture-dashboard PATH]
+  --show-dashboard [--tab overview|analysis|performance|plans|sessions] [--appearance light|dark] [--demo] [--capture-dashboard PATH]
   --show-settings [PANE] [--appearance light|dark] [--capture-settings PATH]
   --show-dashboard --benchmark-dashboard-switches
   --verify-status-toggle
@@ -119,10 +119,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                 attributes: [.posixPermissions: 0o700])
         try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)
         pruneCrashLogs(in: dir)
-        // Precompute "<dir>/crash-" for the signal handler (which must not
-        // call Foundation) and force the scratch buffer's lazy init now.
-        tmCrashDirPrefixC = Array((dir.path + "/crash-").utf8CString.dropLast())
-        _ = tmCrashScratch.count
+        // Precompute everything the signal handler writes; it must not call
+        // Foundation or allocate.
+        tmCrashPrepare(pathPrefix: dir.path + "/crash-", header: tmVersionLine() + "\n")
 
         // Objective-C exception handler: may use Foundation (normal context).
         NSSetUncaughtExceptionHandler { exception in
@@ -134,7 +133,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true,
                                                      attributes: [.posixPermissions: 0o700])
             try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)
-            let line = "uncaught exception \(name): \(reason)\n\(stack)\n"
+            let line = "\(tmVersionLine())\nuncaught exception \(name): \(reason)\n\(stack)\n"
             let path = dir.appendingPathComponent("crash-\(Int(Date().timeIntervalSince1970)).log")
             try? line.write(to: path, atomically: true, encoding: .utf8)
             try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path.path)
@@ -211,8 +210,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if args.contains("--clear-or-key") {
             Database.shared.open()
-            KeychainStore.delete(account: "or-keys", allowPrompt: true)
-            KeychainStore.delete(account: "openrouter-key", allowPrompt: true)
+            let deleted = [KeychainStore.delete(account: "or-keys", allowPrompt: true),
+                           KeychainStore.delete(account: "openrouter-key", allowPrompt: true)]
+            guard !deleted.contains(false) else {
+                print("key clear failed: Keychain delete failed, the key is still stored")
+                exit(1)
+            }
             Database.shared.setSetting("or_keys", nil)
             Database.shared.setSetting("openrouter_key", nil)
             Database.shared.setSetting("or_cred_storage", nil)
@@ -221,8 +224,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if args.contains("--clear-go") {
             Database.shared.open()
-            KeychainStore.delete(account: "go-workspace-id", allowPrompt: true)
-            KeychainStore.delete(account: "go-auth-cookie", allowPrompt: true)
+            let deleted = [KeychainStore.delete(account: "go-workspace-id", allowPrompt: true),
+                           KeychainStore.delete(account: "go-auth-cookie", allowPrompt: true)]
+            guard !deleted.contains(false) else {
+                print("go clear failed: Keychain delete failed, credentials are still stored")
+                exit(1)
+            }
             Database.shared.setSetting("go_workspace_id", nil)
             Database.shared.setSetting("go_auth_cookie", nil)
             Database.shared.setSetting("go_cred_storage", nil)
@@ -414,6 +421,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let isPanelVerification = args.contains("--show-panel")
             || args.contains("--verify-status-toggle")
             || args.contains("--verify-quota-badge")
+        // A second copy would scan and poll beside the first. The updater's
+        // replacement is exempt: it starts while the old copy is on its way out.
+        if !isDashboardVerification, !isPanelVerification, !args.contains("--tm-update-ready"),
+           let bundleID = Bundle.main.bundleIdentifier,
+           let running = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+            .first(where: { $0.processIdentifier != getpid() }) {
+            running.activate()
+            exit(0)
+        }
         NSApp.setActivationPolicy(.accessory)
         Database.shared.open() // synchronous — needed before any DB reads
 
@@ -452,7 +468,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                 AppState.shared.refresh()
-                WindowManager.shared.show()
+                let tab = args.firstIndex(of: "--tab").flatMap { flag -> DashboardView.Tab? in
+                    guard args.indices.contains(flag + 1) else { return nil }
+                    return DashboardView.Tab.allCases.first { $0.rawValue.lowercased() == args[flag + 1].lowercased() }
+                }
+                WindowManager.shared.show(tab: tab)
                 if args.contains("--benchmark-dashboard-switches") {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
                         for pass in 1...2 {
@@ -710,7 +730,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateStatusLabel(_ button: NSStatusBarButton) {
         let app = AppState.shared
         // Status bar shows ONLY today's tokens (user preference); costs live
-        // in the popover and tooltip.
+        // in the popover.
         let text = Format.compact(app.todayTokens)
 
         // Defaults to the system UI font (SF Pro, tabular digits); a
@@ -732,32 +752,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             access += ", \(quotaAlerts.unreadCount) unread"
         }
         button.setAccessibilityValue(access)
-
-        let or = OpenRouterClient.shared
-        let todayActual = app.costToday.actual
-        var tooltip = """
-        ToastMonitor
-        今日 \(Format.compact(app.todayTokens)) tokens（输入 + 输出 + 缓存命中）
-        今日已确认变量支出 \(Format.money(todayActual))
-        今日估算变量支出 \(Format.money(app.costToday.estimated))
-        · 订阅摊销 \(Format.money(subAmortized()))
-        """
-        if or.state.usageDaily > 0 {
-            tooltip += "\n· OpenRouter 今日（UTC）实际 \(Format.money(or.state.usageDaily))"
-        }
-        button.toolTip = tooltip
-    }
-
-    private func subAmortized() -> Double {
-        var t = 0.0
-        let app = AppState.shared
-        for sub in app.subscriptions {
-            guard sub.startDate <= Int64(Date().timeIntervalSince1970) else { continue }
-            if let info = SubscriptionMath.cycleInfo(start: sub.startDate, end: sub.endDate, cycle: sub.cycle) {
-                t += sub.price / Double(info.totalDays)
-            }
-        }
-        return t
     }
 
     @objc private func togglePanel(_ sender: Any?) {
@@ -793,7 +787,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         let lastScan = AppState.shared.lastScan
         let syncItem = NSMenuItem(
-            title: lastScan > 0 ? "Last synced \(Format.dateTime(lastScan))" : "Not yet synced",
+            title: lastScan > 0 ? "Last new usage \(Format.dateTime(lastScan))" : "No usage recorded yet",
             action: nil, keyEquivalent: "")
         syncItem.isEnabled = false
         menu.addItem(syncItem)
@@ -807,19 +801,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         WindowManager.shared.show()
     }
 
-    /// Same refresh sequence as the popover's toolbar button and the
-    /// dashboard toolbar's Refresh item (PopoverRootView.refresh(),
-    /// DashboardToolbarController.refreshData(_:)) — every source's
-    /// independent poller, triggered together.
     @objc private func menuRefreshNow() {
-        DeepSeekBillingClient.shared.refresh(force: true)
-        AppState.shared.refresh(manual: true)
-        CollectorEngine.shared.scheduleScan()
-        OpenRouterClient.shared.refresh()
-        OpenCodeGoClient.shared.refresh()
-        CodexQuotaClient.shared.refresh()
-        ClaudeQuotaClient.shared.refresh(force: true)
-        HermesRemoteClient.shared.maybePoll()
+        AppState.shared.refreshAllSources()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -839,17 +822,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 // MARK: - Crash signal handler (async-signal-safe)
 
-/// "<dir>/crash-" (NUL-terminated). Built once in `installCrashHandlers`
-/// (Foundation allowed there); read-only afterwards.
-nonisolated(unsafe) private var tmCrashDirPrefixC: [CChar] = []
-/// Preallocated scratch buffer. Lazily initialized on first access — forced
-/// during `installCrashHandlers`, so the handler itself never allocates
-/// (malloc is not async-signal-safe).
-nonisolated(unsafe) private var tmCrashScratch = [CChar](repeating: 0, count: 2048)
+/// "ToastMonitor <version> (<build>)", the first line of every crash log.
+private func tmVersionLine() -> String {
+    let info = Bundle.main.infoDictionary
+    let version = info?["CFBundleShortVersionString"] as? String ?? "?"
+    let build = info?["CFBundleVersion"] as? String ?? "?"
+    return "ToastMonitor \(version) (\(build))"
+}
+
+/// Buffers the signal handler writes from, allocated once in
+/// `tmCrashPrepare` and never freed: raw pointers, so the handler never
+/// touches a Swift array (whose accessors may allocate or check exclusivity,
+/// neither async-signal-safe).
+nonisolated(unsafe) private var tmCrashPath: UnsafeMutablePointer<CChar>?
+nonisolated(unsafe) private var tmCrashPathPrefixLength = 0
+nonisolated(unsafe) private var tmCrashText: UnsafeMutablePointer<CChar>?
+nonisolated(unsafe) private var tmCrashHeaderLength = 0
+/// Room after the prefix or header for a timestamp or "signal N\n" and NUL.
+private let tmCrashTailRoom = 32
+
+private func tmCrashPrepare(pathPrefix: String, header: String) {
+    func copy(_ string: String) -> (UnsafeMutablePointer<CChar>, Int) {
+        let bytes = Array(string.utf8)
+        let buffer = UnsafeMutablePointer<CChar>.allocate(capacity: bytes.count + tmCrashTailRoom)
+        for (i, b) in bytes.enumerated() { buffer[i] = CChar(bitPattern: b) }
+        return (buffer, bytes.count)
+    }
+    (tmCrashPath, tmCrashPathPrefixLength) = copy(pathPrefix)
+    (tmCrashText, tmCrashHeaderLength) = copy(header)
+}
 
 /// Appends the decimal digits of `v` (>= 0) to `buf` at `i`, returning the
 /// index after the last digit. Pure integer math — safe in signal handlers.
-private func tmAppendDecimal(_ v: Int64, to buf: UnsafeMutableBufferPointer<CChar>, at i: Int) -> Int {
+private func tmAppendDecimal(_ v: Int64, to buf: UnsafeMutablePointer<CChar>, at i: Int) -> Int {
     var n = 1
     var t = v
     while t >= 10 { n += 1; t /= 10 }
@@ -863,36 +868,29 @@ private func tmAppendDecimal(_ v: Int64, to buf: UnsafeMutableBufferPointer<CCha
     return i + n
 }
 
-/// Writes `<dir>/crash-<unix-ts>.log` with a one-line "signal <N>" marker,
-/// then restores the default disposition and re-raises so the OS records
-/// the crash normally. Only async-signal-safe calls: open/write/close/time/
-/// signal/raise plus integer math on the preallocated buffer (string
-/// literals are static; iterating their utf8 never allocates).
+/// Writes `<dir>/crash-<unix-ts>.log` with the version line and a
+/// "signal <N>" marker, then restores the default disposition and re-raises
+/// so the OS records the crash normally. Only async-signal-safe calls:
+/// open/write/close/time/signal/raise plus integer math on the preallocated
+/// buffers (string literals are static; iterating their utf8 never allocates).
 private func tmCrashSignalHandler(_ sig: Int32) {
-    tmCrashScratch.withUnsafeMutableBufferPointer { buf in
-        var i = 0
-        for c in tmCrashDirPrefixC {
-            if i >= buf.count - 24 { break }
-            buf[i] = c
-            i += 1
-        }
-        i = tmAppendDecimal(Int64(time(nil)), to: buf, at: i)
+    if let path = tmCrashPath, let text = tmCrashText {
+        var i = tmAppendDecimal(Int64(time(nil)), to: path, at: tmCrashPathPrefixLength)
         for b in ".log".utf8 {
-            guard i < buf.count - 2 else { break }
-            buf[i] = CChar(bitPattern: b)
+            path[i] = CChar(bitPattern: b)
             i += 1
         }
-        buf[i] = 0 // NUL-terminate the path
-        let fd = open(buf.baseAddress!, O_WRONLY | O_CREAT | O_TRUNC, 0o600)
+        path[i] = 0 // NUL-terminate the path
+        let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o600)
         if fd >= 0 {
-            var j = 0
+            var j = tmCrashHeaderLength
             for b in "signal ".utf8 {
-                buf[j] = CChar(bitPattern: b)
+                text[j] = CChar(bitPattern: b)
                 j += 1
             }
-            j = tmAppendDecimal(Int64(sig), to: buf, at: j)
-            buf[j] = 0x0A // '\n'
-            _ = write(fd, buf.baseAddress!, j + 1)
+            j = tmAppendDecimal(Int64(sig), to: text, at: j)
+            text[j] = 0x0A // '\n'
+            _ = write(fd, text, j + 1)
             close(fd)
         }
     }

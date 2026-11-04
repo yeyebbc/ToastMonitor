@@ -25,6 +25,13 @@ final class Database: @unchecked Sendable {
     /// but prepare/step/ALTER/commit errors must never be silently committed.
     private var transactionWriteError = false
     private var startupHadError = false
+    /// Why the store cannot be used, after an open. An empty database is not
+    /// a problem; this is what keeps a broken one from looking like a fresh install.
+    enum OpenProblem: Equatable, Sendable {
+        case damaged(String)
+        case readOnly(String)
+    }
+    private(set) var openProblem: OpenProblem?
     private struct SettingCacheChange {
         let value: String?
     }
@@ -119,7 +126,10 @@ final class Database: @unchecked Sendable {
 
         var handle: OpaquePointer?
         guard sqlite3_open_v2(dbPath, &handle, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK else {
-            NSLog("[ToastMonitor] DB open failed: %s", sqlite3_errmsg(handle))
+            let message = handle.map { String(cString: sqlite3_errmsg($0)) } ?? "Could not open the file"
+            NSLog("[ToastMonitor] DB open failed: %@", message)
+            openProblem = .damaged(message)
+            if let handle { sqlite3_close(handle) }
             return
         }
         db = handle
@@ -153,6 +163,56 @@ final class Database: @unchecked Sendable {
         // Last: every migration above may rebuild or rewrite `turns`, and a
         // restored file may carry a stale rollup. Install, then verify.
         ensureRollup()
+        openProblem = usabilityProblem()
+    }
+
+    /// Reads the schema and takes the write lock, without changing anything.
+    private func usabilityProblem() -> OpenProblem? {
+        guard let db else { return .damaged("Could not open the file") }
+        var stmt: OpaquePointer?
+        let readable = sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM sqlite_master;", -1, &stmt, nil) == SQLITE_OK
+            && sqlite3_step(stmt) == SQLITE_ROW
+        let readError = String(cString: sqlite3_errmsg(db))
+        sqlite3_finalize(stmt)
+        guard readable else { return .damaged(readError) }
+        if sqlite3_db_readonly(db, "main") == 1 { return .readOnly("The database file is read-only.") }
+        guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else {
+            let code = sqlite3_errcode(db)
+            let message = String(cString: sqlite3_errmsg(db))
+            // Another writer holding the lock is ordinary, not a broken store.
+            if code == SQLITE_BUSY || code == SQLITE_LOCKED { return nil }
+            return code == SQLITE_READONLY ? .readOnly(message) : .damaged(message)
+        }
+        sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+        return nil
+    }
+
+    /// Recovery from a store that cannot be opened: moves it aside, never
+    /// deleting it, then opens `source` in its place or starts empty.
+    func replaceUnusableStore(with source: String?) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        let fm = FileManager.default
+        close()
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        let stamp = formatter.string(from: Date())
+        do {
+            for suffix in ["", "-wal", "-shm"] where fm.fileExists(atPath: dbPath + suffix) {
+                try fm.moveItem(atPath: dbPath + suffix, toPath: "\(dbPath).damaged-\(stamp)\(suffix)")
+            }
+            if let source {
+                try fm.copyItem(atPath: source, toPath: dbPath)
+                try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: dbPath)
+            }
+        } catch {
+            NSLog("[ToastMonitor] store replacement failed: %@", error.localizedDescription)
+            openLocked(dbPath)
+            return false
+        }
+        openLocked(dbPath)
+        bumpDataVersion()
+        return openProblem == nil
     }
     /// Older stores can report user_version=1 while missing tables that were
     /// created by the original bootstrap. Recreate absent tables before
@@ -172,6 +232,7 @@ final class Database: @unchecked Sendable {
           reasoning_tokens INTEGER NOT NULL DEFAULT 0,
           cache_read INTEGER NOT NULL DEFAULT 0,
           cache_write INTEGER NOT NULL DEFAULT 0,
+          cache_write_1h INTEGER,
           cost REAL NOT NULL DEFAULT 0,
           provider TEXT,
           source_instance TEXT NOT NULL DEFAULT 'local',
@@ -281,7 +342,8 @@ final class Database: @unchecked Sendable {
                              ("reasoning_tokens", "INTEGER NOT NULL DEFAULT 0"),
                              ("provider", "TEXT"),
                              ("source_instance", "TEXT NOT NULL DEFAULT 'local'"),
-                             ("pricing_version", "TEXT")] {
+                             ("pricing_version", "TEXT"),
+                             ("cache_write_1h", "INTEGER")] {
             var colStmt: OpaquePointer?
             let check = "SELECT COUNT(*) FROM pragma_table_info('turns') WHERE name='\(name)';"
             guard sqlite3_prepare_v2(db, check, -1, &colStmt, nil) == SQLITE_OK else {
@@ -352,6 +414,7 @@ final class Database: @unchecked Sendable {
               reasoning_tokens INTEGER NOT NULL DEFAULT 0,
               cache_read INTEGER NOT NULL DEFAULT 0,
               cache_write INTEGER NOT NULL DEFAULT 0,
+              cache_write_1h INTEGER,
               cost REAL NOT NULL DEFAULT 0,
               provider TEXT,
               source_instance TEXT NOT NULL DEFAULT 'local',
@@ -361,8 +424,8 @@ final class Database: @unchecked Sendable {
             );
             """,
             """
-            INSERT INTO turns (id, tool, session_id, project, model, ts, input_tokens, output_tokens, reasoning_tokens, cache_read, cache_write, cost, provider, source_instance, pricing_version, event_id, cost_quality)
-              SELECT id, tool, session_id, project, model, ts, input_tokens, output_tokens, reasoning_tokens, cache_read, cache_write, cost, provider, source_instance, pricing_version, event_id, cost_quality FROM turns_legacy;
+            INSERT INTO turns (id, tool, session_id, project, model, ts, input_tokens, output_tokens, reasoning_tokens, cache_read, cache_write, cache_write_1h, cost, provider, source_instance, pricing_version, event_id, cost_quality)
+              SELECT id, tool, session_id, project, model, ts, input_tokens, output_tokens, reasoning_tokens, cache_read, cache_write, cache_write_1h, cost, provider, source_instance, pricing_version, event_id, cost_quality FROM turns_legacy;
             """,
             """
             UPDATE turns SET
@@ -433,6 +496,7 @@ final class Database: @unchecked Sendable {
           reasoning_tokens INTEGER NOT NULL DEFAULT 0,
           cache_read INTEGER NOT NULL DEFAULT 0,
           cache_write INTEGER NOT NULL DEFAULT 0,
+          cache_write_1h INTEGER,
           cost REAL NOT NULL DEFAULT 0,
           provider TEXT,
           source_instance TEXT NOT NULL DEFAULT 'local',
@@ -556,6 +620,9 @@ final class Database: @unchecked Sendable {
                 setUserVersion(0)
             }
         }
+        // Old stores can lack tables the steps below alter, and a failed step
+        // now stops the run, so recreate them first.
+        ensureBaseTables()
         let previousVersion = userVersion()
         if previousVersion < 3 {
             guard let db else { return }
@@ -578,6 +645,8 @@ final class Database: @unchecked Sendable {
                 rollbackOrPoison()
                 setUserVersion(previousVersion)
                 transactionWriteError = false
+                startupHadError = true
+                return
             }
         }
         // v4: openrouter_snapshots account columns, added here once rather
@@ -598,6 +667,8 @@ final class Database: @unchecked Sendable {
                 rollbackOrPoison()
                 setUserVersion(previousVersion)
                 transactionWriteError = false
+                startupHadError = true
+                return
             }
         }
         // v5: per-call timing (time to first token, output speed). Kept apart
@@ -627,6 +698,8 @@ final class Database: @unchecked Sendable {
             if !(ok && sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK) {
                 rollbackOrPoison()
                 setUserVersion(previousVersion)
+                startupHadError = true
+                return
             }
         }
         // v6: DeepSeek balance history. Its API has no spend history for
@@ -645,6 +718,8 @@ final class Database: @unchecked Sendable {
             if !(ok && sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK) {
                 rollbackOrPoison()
                 setUserVersion(previousVersion)
+                startupHadError = true
+                return
             }
         }
         // v7 does not delete rows. The collector rebuilds only the sessions
@@ -674,12 +749,34 @@ final class Database: @unchecked Sendable {
             if !(ok && sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK) {
                 rollbackOrPoison()
                 setUserVersion(previousVersion)
+                startupHadError = true
+                return
+            }
+        }
+        // v8: the one-hour share of Claude cache writes. NULL means not known
+        // yet; `cache_split_replay` has the collector read logs still on disk
+        // to fill it. Rows whose log is gone stay NULL and keep their cost.
+        if previousVersion < 8 {
+            guard let db else { return }
+            guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return }
+            transactionWriteError = false
+            ensureColumn("cache_write_1h", "INTEGER", table: "turns")
+            let ok = !transactionWriteError && execChecked("""
+            INSERT INTO settings (k, v) VALUES ('cache_split_replay', 'pending')
+            ON CONFLICT(k) DO UPDATE SET v=excluded.v;
+            """) && setUserVersion(8)
+            if !(ok && sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK) {
+                rollbackOrPoison()
+                setUserVersion(previousVersion)
+                transactionWriteError = false
+                startupHadError = true
+                return
             }
         }
     }
 
     /// The user_version the last migration step sets.
-    static let schemaVersion: Int32 = 7
+    static let schemaVersion: Int32 = 8
 
     private func userVersion() -> Int32 {
         guard let db else { return 0 }
@@ -738,16 +835,22 @@ final class Database: @unchecked Sendable {
         let columns = """
           tool, session_id, project, model, ts, input_tokens, output_tokens,
           reasoning_tokens, cache_read, cache_write, cost, provider,
-          source_instance, pricing_version, event_id, cost_quality
+          source_instance, pricing_version, event_id, cost_quality, cache_write_1h
         """
         let insertSQL = """
-        INSERT INTO turns (\(columns)) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        INSERT INTO turns (\(columns)) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(tool, event_id) WHERE event_id IS NOT NULL DO UPDATE SET
+          cache_write_1h = excluded.cache_write_1h,
+          pricing_version = NULL
+        WHERE turns.cache_write_1h IS NULL AND excluded.cache_write_1h IS NOT NULL
         ON CONFLICT DO NOTHING;
         """
         // Partial unique index: (tool, event_id) WHERE event_id IS NOT NULL.
         let greaterSQL = """
-        INSERT INTO turns (\(columns)) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        INSERT INTO turns (\(columns)) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(tool, event_id) WHERE event_id IS NOT NULL DO UPDATE SET
+          cache_write_1h = COALESCE(MAX(turns.cache_write_1h, excluded.cache_write_1h),
+                                    turns.cache_write_1h, excluded.cache_write_1h),
           input_tokens = MAX(turns.input_tokens, excluded.input_tokens),
           output_tokens = MAX(turns.output_tokens, excluded.output_tokens),
           reasoning_tokens = MAX(turns.reasoning_tokens, excluded.reasoning_tokens),
@@ -779,10 +882,11 @@ final class Database: @unchecked Sendable {
            OR excluded.output_tokens > turns.output_tokens
            OR excluded.reasoning_tokens > turns.reasoning_tokens
            OR excluded.cache_read > turns.cache_read
-           OR excluded.cache_write > turns.cache_write;
+           OR excluded.cache_write > turns.cache_write
+           OR (turns.cache_write_1h IS NULL AND excluded.cache_write_1h IS NOT NULL);
         """
         let replaceSQL = """
-        INSERT INTO turns (\(columns)) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        INSERT INTO turns (\(columns)) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(tool, event_id) WHERE event_id IS NOT NULL DO UPDATE SET
           session_id = excluded.session_id,
           project = COALESCE(excluded.project, turns.project),
@@ -845,6 +949,7 @@ final class Database: @unchecked Sendable {
             sqlite3_bind_text(stmt, 14, (t.pricingVersion as NSString?)?.utf8String ?? nil, -1, SQLITE_TRANSIENT)
             sqlite3_bind_text(stmt, 15, (eid as NSString).utf8String, -1, SQLITE_TRANSIENT)
             sqlite3_bind_text(stmt, 16, (t.costQuality as NSString).utf8String, -1, SQLITE_TRANSIENT)
+            if let write1h = t.cacheWrite1h { sqlite3_bind_int64(stmt, 17, write1h) } else { sqlite3_bind_null(stmt, 17) }
         }
 
         var ok = true
@@ -1182,6 +1287,20 @@ final class Database: @unchecked Sendable {
         sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
     }
 
+    /// One-shot after the v8 migration: rewinds every Claude log so its rows
+    /// pick up the one-hour cache share. Event ids keep the replay from adding
+    /// rows, and the sessions are not deleted first as in a rebuild.
+    func replayClaudeForCacheSplit(paths: [String]) {
+        lock.lock(); defer { lock.unlock() }
+        guard setting("cache_split_replay") == "pending" else { return }
+        _ = inTransaction {
+            for path in paths where !setScanState(path, size: 0, mtime: 0, identity: 0, context: nil) {
+                return false
+            }
+            return setSetting("cache_split_replay", "done")
+        }
+    }
+
     /// Deletes `prefix + session + ":" … ";"` only. `;` is the next byte
     /// after `:`, so a longer session id is outside the range. Caller holds
     /// `lock` and an open transaction.
@@ -1205,36 +1324,42 @@ final class Database: @unchecked Sendable {
         return true
     }
 
-    /// Reprices turns whose price-table revision is stale, and stamps unknown
-    /// models so a cost of zero is not selected again until the table changes.
-    /// A known model whose computed price is also zero is stamped with
-    /// `Pricing.zeroCostStamp` so the 60s pass does not select it again.
+    /// Fills in costs that were never computed: a model the table has since
+    /// learned, or tokens merged from two snapshots. A cost already stored is
+    /// history and stays when `Pricing.version` changes, except for
+    /// `Pricing.correctedModels`, whose old entries were simply wrong. Claude
+    /// rows with an unknown one-hour share are not repriced, because the
+    /// five-minute rate would understate them. Unknown models are stamped so a
+    /// cost of zero is not selected again until the table changes; a known
+    /// model whose computed price is also zero gets `Pricing.zeroCostStamp`.
     func backfillCosts() {
         lock.lock(); defer { lock.unlock() }
         guard let db else { return }
         let now = Int64(Date().timeIntervalSince1970)
         if let last = Int64(setting("backfill_costs_last") ?? "0"), now - last < 60 { return }
         var stmt: OpaquePointer?
+        let corrected = Pricing.correctedModels.map { "model LIKE '\($0)'" }.joined(separator: " OR ")
         let select = """
-        SELECT id, model, input_tokens, output_tokens, cache_read, cache_write, tool, cost_quality
+        SELECT id, model, input_tokens, output_tokens, cache_read, cache_write, tool, cost_quality, cache_write_1h,
+               pricing_version IS NOT NULL AND cost != 0
         FROM turns
         WHERE tool != 'hermes' AND model IS NOT NULL AND model != ''
           AND (
             (cost = 0 AND cost_quality = 'estimated'
                AND (pricing_version IS NULL OR pricing_version != ?))
-            OR (cost_quality = 'estimated'
-               AND (pricing_version IS NULL OR pricing_version != ?)
-               AND (pricing_version IS NULL OR pricing_version != ?))
             OR (cost = 0 AND cost_quality = 'unknown'
                AND (pricing_version IS NULL OR pricing_version != ?))
+            OR (cost_quality = 'estimated'
+               AND (tool != 'claude' OR cache_write = 0 OR cache_write_1h IS NOT NULL)
+               AND (pricing_version IS NULL
+                    OR (pricing_version < ? AND (\(corrected)))))
           );
         """
         guard sqlite3_prepare_v2(db, select, -1, &stmt, nil) == SQLITE_OK else { return }
         sqlite3_bind_text(stmt, 1, (Pricing.zeroCostStamp as NSString).utf8String, -1, SQLITE_TRANSIENT)
         sqlite3_bind_text(stmt, 2, (Pricing.version as NSString).utf8String, -1, SQLITE_TRANSIENT)
-        sqlite3_bind_text(stmt, 3, (Pricing.zeroCostStamp as NSString).utf8String, -1, SQLITE_TRANSIENT)
-        sqlite3_bind_text(stmt, 4, (Pricing.version as NSString).utf8String, -1, SQLITE_TRANSIENT)
-        var rows: [(id: Int64, model: String, input: Int64, output: Int64, cr: Int64, cw: Int64, includesCache: Bool, quality: String)] = []
+        sqlite3_bind_text(stmt, 3, (Pricing.correctionRevision as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        var rows: [(id: Int64, model: String, input: Int64, output: Int64, cr: Int64, cw: Int64, includesCache: Bool, quality: String, cw1h: Int64, alreadyPriced: Bool)] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
             guard let model = SQLiteText.column(stmt, 1) else { continue }
             rows.append((sqlite3_column_int64(stmt, 0),
@@ -1242,7 +1367,9 @@ final class Database: @unchecked Sendable {
                          sqlite3_column_int64(stmt, 2), sqlite3_column_int64(stmt, 3),
                          sqlite3_column_int64(stmt, 4), sqlite3_column_int64(stmt, 5),
                          SQLiteText.column(stmt, 6) == "codex",
-                         SQLiteText.column(stmt, 7) ?? "estimated"))
+                         SQLiteText.column(stmt, 7) ?? "estimated",
+                         sqlite3_column_int64(stmt, 8),
+                         sqlite3_column_int(stmt, 9) != 0))
         }
         sqlite3_finalize(stmt)
 
@@ -1255,9 +1382,15 @@ final class Database: @unchecked Sendable {
             && sqlite3_prepare_v2(db, stamp, -1, &stampStmt, nil) == SQLITE_OK
         if ok {
             for r in rows {
+                // A correction fixes a wrong table entry. The long-context
+                // charge is a newer rule, and history does not take it on.
+                let skipsLongContext = r.alreadyPriced
+                    && Pricing.price(for: r.model)?.longPromptThreshold == Pricing.longContextThreshold
                 if let cost = Pricing.estimate(model: r.model, input: r.input, output: r.output,
-                                               cacheRead: r.cr, cacheWrite: r.cw,
-                                               inputIncludesCache: r.includesCache) {
+                                               cacheRead: r.cr, cacheWrite: r.cw - min(r.cw1h, r.cw),
+                                               inputIncludesCache: r.includesCache,
+                                               cacheWrite1h: min(r.cw1h, r.cw),
+                                               longPrompt: skipsLongContext ? false : nil) {
                     let revision = cost == 0 ? Pricing.zeroCostStamp : Pricing.version
                     sqlite3_bind_double(pricedStmt, 1, cost)
                     sqlite3_bind_text(pricedStmt, 2, (revision as NSString).utf8String, -1, SQLITE_TRANSIENT)
@@ -1485,9 +1618,7 @@ final class Database: @unchecked Sendable {
         // subscription's fixed cost; its estimated API price must not also
         // appear as variable spend (subscriptions pay subscriptions, API pays
         // API). Tokens stay counted; only the cost sum is zeroed.
-        let codexCovered = codexBilledBySubscription()
-        let costExpr = codexCovered ? "SUM(CASE WHEN tool='codex' THEN 0.0 ELSE cost END)" : "SUM(cost)"
-        var sql = "SELECT SUM(input_tokens), SUM(output_tokens), SUM(cache_read), SUM(cache_write), \(costExpr), SUM(n) FROM (\(Self.usageSource))"
+        var sql = "SELECT SUM(input_tokens), SUM(output_tokens), SUM(cache_read), SUM(cache_write), \(costSum), SUM(n) FROM (\(Self.usageSource))"
         if tool != nil { sql += " WHERE tool=?5" }
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return out }
@@ -1510,6 +1641,11 @@ final class Database: @unchecked Sendable {
     /// mode Codex estimated costs are excluded from variable spend.
     func codexBilledBySubscription() -> Bool {
         setting("codex_billing_mode") == "subscription"
+    }
+
+    /// Every cost total: Codex covered by a subscription costs nothing extra.
+    private var costSum: String {
+        codexBilledBySubscription() ? "SUM(CASE WHEN tool='codex' THEN 0.0 ELSE cost END)" : "SUM(cost)"
     }
 
     func totalsByTool(from: Int64, to: Int64) -> [ToolTotals] {
@@ -1551,7 +1687,7 @@ final class Database: @unchecked Sendable {
         var stmt: OpaquePointer?
         let sql = """
         SELECT CAST(strftime('%Y%m%d', bucket, 'unixepoch', 'localtime') AS INTEGER) AS day, tool,
-               SUM(input_tokens), SUM(output_tokens), SUM(cache_read), SUM(cost), SUM(n)
+               SUM(input_tokens), SUM(output_tokens), SUM(cache_read), \(costSum), SUM(n)
         FROM (\(Self.usageSource)) GROUP BY day, tool;
         """
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return out }
@@ -1576,8 +1712,8 @@ final class Database: @unchecked Sendable {
         guard let db else { return out }
         var stmt: OpaquePointer?
         let sql = """
-        SELECT tool, COALESCE(NULLIF(model,''), '(unknown)'), SUM(input_tokens), SUM(output_tokens), SUM(cache_read), SUM(cost), SUM(n)
-        FROM (\(Self.usageSource)) GROUP BY tool, model ORDER BY SUM(cost) DESC;
+        SELECT tool, COALESCE(NULLIF(model,''), '(unknown)'), SUM(input_tokens), SUM(output_tokens), SUM(cache_read), \(costSum), SUM(n)
+        FROM (\(Self.usageSource)) GROUP BY tool, model ORDER BY \(costSum) DESC;
         """
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return out }
         bindUsageRange(stmt, from: from, to: to)
@@ -1595,17 +1731,36 @@ final class Database: @unchecked Sendable {
         return out
     }
 
+    /// A session with neither a date nor usage is a stub from the source's
+    /// own index; it is not listed.
+    private static let listedSession = "(s.updated > 0 OR EXISTS (SELECT 1 FROM turns t WHERE t.tool=s.tool AND t.session_id=s.session_id))"
+
+    func sessionCount(tool: ToolKind? = nil) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        guard let db else { return 0 }
+        var stmt: OpaquePointer?
+        let sql = "SELECT COUNT(*) FROM sessions s WHERE \(Self.listedSession)\(tool != nil ? " AND s.tool=?" : "");"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return 0 }
+        defer { sqlite3_finalize(stmt) }
+        if let tool { sqlite3_bind_text(stmt, 1, (tool.rawValue as NSString).utf8String, -1, SQLITE_TRANSIENT) }
+        return sqlite3_step(stmt) == SQLITE_ROW ? Int(sqlite3_column_int64(stmt, 0)) : 0
+    }
+
     func sessions(tool: ToolKind? = nil, limit: Int = 100) -> [SessionRow] {
         lock.lock(); defer { lock.unlock() }
         var out: [SessionRow] = []
         guard let db else { return out }
+        // A source that keeps no session date falls back to its last turn.
+        let cost = codexBilledBySubscription() ? "SUM(CASE WHEN t.tool='codex' THEN 0.0 ELSE t.cost END)" : "SUM(t.cost)"
         var sql = """
-        SELECT s.tool, s.session_id, s.title, s.project, s.model, s.created, s.updated,
-               COALESCE(SUM(t.input_tokens),0), COALESCE(SUM(t.output_tokens),0), COALESCE(SUM(t.cache_read),0), COALESCE(SUM(t.cost),0), COUNT(t.id)
+        SELECT s.tool, s.session_id, s.title, s.project, s.model, s.created,
+               CASE WHEN s.updated > 0 THEN s.updated ELSE COALESCE(MAX(t.ts), 0) END AS last_seen,
+               COALESCE(SUM(t.input_tokens),0), COALESCE(SUM(t.output_tokens),0), COALESCE(SUM(t.cache_read),0), COALESCE(\(cost),0), COUNT(t.id)
         FROM sessions s LEFT JOIN turns t ON t.tool=s.tool AND t.session_id=s.session_id
+        WHERE \(Self.listedSession)
         """
-        if tool != nil { sql += " WHERE s.tool=?" }
-        sql += " GROUP BY s.tool, s.session_id ORDER BY s.updated DESC LIMIT ?;"
+        if tool != nil { sql += " AND s.tool=?" }
+        sql += " GROUP BY s.tool, s.session_id ORDER BY last_seen DESC LIMIT ?;"
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return out }
         var idx: Int32 = 1
@@ -1638,8 +1793,9 @@ final class Database: @unchecked Sendable {
         var out: [(ts: Int64, model: String?, input: Int64, output: Int64, cacheRead: Int64, cacheWrite: Int64, cost: Double)] = []
         guard let db else { return out }
         var stmt: OpaquePointer?
+        let cost = sessionTool == "codex" && codexBilledBySubscription() ? "0.0" : "cost"
         let sql = """
-        SELECT ts, model, input_tokens, output_tokens, cache_read, cache_write, cost
+        SELECT ts, model, input_tokens, output_tokens, cache_read, cache_write, \(cost)
         FROM turns WHERE tool=? AND session_id=? ORDER BY ts DESC LIMIT ?;
         """
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return out }
@@ -1831,6 +1987,17 @@ final class Database: @unchecked Sendable {
         return "\(sqlite3_column_int64(stmt, 0)):\(sqlite3_column_int64(stmt, 1))"
     }
 
+    func claudeQuotaSampleLatestTs() -> Int64 {
+        lock.lock(); defer { lock.unlock() }
+        guard let db else { return 0 }
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT COALESCE(MAX(ts),0) FROM claude_quota_samples;",
+                                 -1, &stmt, nil) == SQLITE_OK else { return 0 }
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
+        return sqlite3_column_int64(stmt, 0)
+    }
+
     func claudeQuotaSamples(since: Int64) -> [ClaudeNonLocalEstimator.Sample] {
         lock.lock(); defer { lock.unlock() }
         guard let db else { return [] }
@@ -1868,10 +2035,12 @@ final class Database: @unchecked Sendable {
         let intervalCount = samples.count - 1
         var freshDiff = [Int64](repeating: 0, count: intervalCount + 1)
         var totalByInterval = [Int64](repeating: 0, count: intervalCount)
+        var costByInterval = [Double](repeating: 0, count: intervalCount)
+        var unpricedByInterval = [Int64](repeating: 0, count: intervalCount)
         var stmt: OpaquePointer?
         let sql = """
         SELECT ts, input_tokens + output_tokens + cache_write,
-               input_tokens + output_tokens + cache_read
+               input_tokens + output_tokens + cache_read, cost
         FROM turns
         WHERE tool = 'claude' AND ts >= ? AND ts <= ?
         ORDER BY ts;
@@ -1906,6 +2075,7 @@ final class Database: @unchecked Sendable {
             let ts = sqlite3_column_int64(stmt, 0)
             let fresh = max(sqlite3_column_int64(stmt, 1), 0)
             let total = max(sqlite3_column_int64(stmt, 2), 0)
+            let cost = sqlite3_column_double(stmt, 3)
 
             let firstFreshInterval = lowerBoundEnd(ts)
             let afterLastFreshInterval = upperBoundStart(ts + ClaudeNonLocalEstimator.serverLagSeconds)
@@ -1919,6 +2089,11 @@ final class Database: @unchecked Sendable {
             if totalInterval < intervalCount,
                samples[totalInterval].ts < ts {
                 totalByInterval[totalInterval] += total
+                if cost > 0 {
+                    costByInterval[totalInterval] += cost
+                } else {
+                    unpricedByInterval[totalInterval] += total
+                }
             }
         }
         var out: [ClaudeNonLocalEstimator.LocalIntervalTotals] = []
@@ -1926,7 +2101,8 @@ final class Database: @unchecked Sendable {
         var freshRunning: Int64 = 0
         for i in 0..<intervalCount {
             freshRunning += freshDiff[i]
-            out.append(.init(freshTokens: freshRunning, totalTokens: totalByInterval[i]))
+            out.append(.init(freshTokens: freshRunning, totalTokens: totalByInterval[i],
+                             cost: costByInterval[i], unpricedTokens: unpricedByInterval[i]))
         }
         return out
     }
@@ -2160,34 +2336,6 @@ final class Database: @unchecked Sendable {
         return (deepSeekSeries[currency] ?? []).filter { $0.ts >= start }
     }
 
-    func orSpendSince(_ start: Int64) -> Double {
-        lock.lock(); defer { lock.unlock() }
-        guard let db else { return 0 }
-        var stmt: OpaquePointer?
-        let startDay = start / 86400
-        var baseline: Double = 0
-        let baselineSQL = "SELECT usage_daily FROM openrouter_snapshots WHERE ts < ? ORDER BY ts DESC LIMIT 1;"
-        if sqlite3_prepare_v2(db, baselineSQL, -1, &stmt, nil) == SQLITE_OK {
-            sqlite3_bind_int64(stmt, 1, start)
-            if sqlite3_step(stmt) == SQLITE_ROW { baseline = sqlite3_column_double(stmt, 0) }
-            sqlite3_finalize(stmt)
-        }
-        let sql = """
-        SELECT ts / 86400 AS utc_day, MAX(usage_daily) FROM openrouter_snapshots
-        WHERE ts >= ? GROUP BY utc_day;
-        """
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return 0 }
-        sqlite3_bind_int64(stmt, 1, start)
-        var total: Double = 0
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            let day = sqlite3_column_int64(stmt, 0)
-            let maxDaily = sqlite3_column_double(stmt, 1)
-            total += day == startDay ? max(maxDaily - baseline, 0) : maxDaily
-        }
-        sqlite3_finalize(stmt)
-        return total
-    }
-
     /// Daily aggregates grouped by (day, model) for the model grouping view.
     func dailyAggregatesByModel(days: Int) -> [(day: Int64, model: String, input: Int64, output: Int64, cacheRead: Int64, cost: Double, count: Int64, totalTokens: Int64)] {
         lock.lock(); defer { lock.unlock() }
@@ -2197,7 +2345,7 @@ final class Database: @unchecked Sendable {
         let sql = """
         SELECT CAST(strftime('%Y%m%d', bucket, 'unixepoch', 'localtime') AS INTEGER) AS day,
                COALESCE(NULLIF(model, ''), '(unknown)') AS model,
-               SUM(input_tokens), SUM(output_tokens), SUM(cache_read), SUM(cost), SUM(n), SUM(\(ToolKind.totalTokensSQL)) AS total_tokens
+               SUM(input_tokens), SUM(output_tokens), SUM(cache_read), \(costSum), SUM(n), SUM(\(ToolKind.totalTokensSQL)) AS total_tokens
         FROM (\(Self.usageSource)) GROUP BY day, model ORDER BY day;
         """
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
@@ -2258,20 +2406,12 @@ final class Database: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         guard let db else { return 0 }
         var stmt: OpaquePointer?
-        let sql: String
-        if tool != nil {
-            sql = """
-            SELECT model, SUM(input_tokens), SUM(output_tokens), SUM(cache_read), SUM(cache_write), tool
-            FROM (\(Self.usageSource)) WHERE tool = ?5
-            GROUP BY tool, model, (tool = 'codex' AND input_tokens < cache_read);
-            """
-        } else {
-            sql = """
-            SELECT model, SUM(input_tokens), SUM(output_tokens), SUM(cache_read), SUM(cache_write), tool
-            FROM (\(Self.usageSource))
-            GROUP BY tool, model, (tool = 'codex' AND input_tokens < cache_read);
-            """
-        }
+        let sql = """
+        SELECT model, SUM(input_tokens), SUM(output_tokens), SUM(cache_read), SUM(cache_write), tool,
+               SUM(cache_write_1h), long_prompt
+        FROM (\(Self.usageSource)) \(tool != nil ? "WHERE tool = ?5" : "")
+        GROUP BY tool, model, (tool = 'codex' AND input_tokens < cache_read), long_prompt;
+        """
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return 0 }
         bindUsageRange(stmt, from: from, to: to)
         if let tool {
@@ -2280,12 +2420,16 @@ final class Database: @unchecked Sendable {
         var total = 0.0
         while sqlite3_step(stmt) == SQLITE_ROW {
             let model = sqlite3_column_type(stmt, 0) == SQLITE_NULL ? nil : String(cString: sqlite3_column_text(stmt, 0))
+            let cacheWrite = sqlite3_column_int64(stmt, 4)
+            let write1h = min(sqlite3_column_int64(stmt, 6), cacheWrite)
             guard let cost = Pricing.estimate(model: model,
                                               input: sqlite3_column_int64(stmt, 1),
                                               output: sqlite3_column_int64(stmt, 2),
                                               cacheRead: sqlite3_column_int64(stmt, 3),
-                                              cacheWrite: sqlite3_column_int64(stmt, 4),
-                                              inputIncludesCache: String(cString: sqlite3_column_text(stmt, 5)) == "codex") else { continue }
+                                              cacheWrite: cacheWrite - write1h,
+                                              inputIncludesCache: String(cString: sqlite3_column_text(stmt, 5)) == "codex",
+                                              cacheWrite1h: write1h,
+                                              longPrompt: sqlite3_column_int(stmt, 7) != 0) else { continue }
             total += cost
         }
         sqlite3_finalize(stmt)
@@ -2306,91 +2450,84 @@ final class Database: @unchecked Sendable {
     }
 
     struct LocalRebuildPreview: Equatable, Sendable {
-        let turns: Int
-        let sessions: Int
-        let tokens: Int64
+        /// Sessions whose log is still on disk. These are re-read.
+        var turns: Int
+        var sessions: Int
+        var tokens: Int64
+        /// History whose log is gone. A rebuild leaves it untouched.
+        var keptTurns = 0
+        var keptSessions = 0
+        var keptTokens: Int64 = 0
     }
 
-    func previewLocalRebuild(tools: [ToolKind]) -> LocalRebuildPreview {
+    /// Session ids a rebuild removes, and the logs to read again. Codex files
+    /// without a usable id stay out of both, as in the v7 recount: replaying
+    /// them without deleting their rows is not safe.
+    private func rebuildTargets(claudePaths: [String], codexPaths: [String])
+        -> (claude: Set<String>, codex: Set<String>, reset: [String]) {
+        let claude = Set(claudePaths.compactMap { ClaudeCodeParser.recountSessionID(path: $0) })
+        var codex = Set<String>()
+        var reset = claudePaths
+        for path in codexPaths {
+            guard let sid = CodexParser.recountSessionID(path: path, context: scanState(path).context) else { continue }
+            codex.insert(sid)
+            reset.append(path)
+        }
+        return (claude, codex, reset)
+    }
+
+    func previewLocalRebuild(claudePaths: [String], codexPaths: [String]) -> LocalRebuildPreview {
         lock.lock(); defer { lock.unlock() }
-        guard let db, !tools.isEmpty else { return .init(turns: 0, sessions: 0, tokens: 0) }
-        var turns = 0
-        var sessions = 0
-        var tokens: Int64 = 0
+        guard let db else { return .init(turns: 0, sessions: 0, tokens: 0) }
+        let targets = rebuildTargets(claudePaths: claudePaths, codexPaths: codexPaths)
+        let sql = """
+        SELECT tool, session_id, COUNT(*),
+               COALESCE(SUM(input_tokens + output_tokens + CASE WHEN tool='codex' THEN 0 ELSE cache_read END),0)
+        FROM turns WHERE tool IN ('claude','codex') GROUP BY tool, session_id;
+        """
         var stmt: OpaquePointer?
-        for tool in tools {
-            let raw = tool.rawValue
-            if sqlite3_prepare_v2(db, "SELECT COUNT(*), COALESCE(SUM(input_tokens + output_tokens + CASE WHEN tool='codex' THEN 0 ELSE cache_read END),0) FROM turns WHERE tool=?;", -1, &stmt, nil) == SQLITE_OK {
-                sqlite3_bind_text(stmt, 1, (raw as NSString).utf8String, -1, SQLITE_TRANSIENT)
-                if sqlite3_step(stmt) == SQLITE_ROW {
-                    turns += Int(sqlite3_column_int64(stmt, 0))
-                    tokens += sqlite3_column_int64(stmt, 1)
-                }
-                sqlite3_finalize(stmt)
-                stmt = nil
-            }
-            if sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM sessions WHERE tool=?;", -1, &stmt, nil) == SQLITE_OK {
-                sqlite3_bind_text(stmt, 1, (raw as NSString).utf8String, -1, SQLITE_TRANSIENT)
-                if sqlite3_step(stmt) == SQLITE_ROW { sessions += Int(sqlite3_column_int64(stmt, 0)) }
-                sqlite3_finalize(stmt)
-                stmt = nil
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return .init(turns: 0, sessions: 0, tokens: 0) }
+        defer { sqlite3_finalize(stmt) }
+        var out = LocalRebuildPreview(turns: 0, sessions: 0, tokens: 0)
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let sid = SQLiteText.column(stmt, 1) ?? ""
+            let turns = Int(sqlite3_column_int64(stmt, 2))
+            let tokens = sqlite3_column_int64(stmt, 3)
+            let targeted = SQLiteText.column(stmt, 0) == "codex" ? targets.codex : targets.claude
+            if targeted.contains(sid) {
+                out.turns += turns
+                out.sessions += 1
+                out.tokens += tokens
+            } else {
+                out.keptTurns += turns
+                out.keptSessions += 1
+                out.keptTokens += tokens
             }
         }
-        return .init(turns: turns, sessions: sessions, tokens: tokens)
+        return out
     }
 
-    /// Removes local usage for selected tools and their file cursors in one
-    /// transaction. Callers must first create a backup and must only pass tools
-    /// currently configured as local; the next collector scan rebuilds truth
-    /// from canonical raw events.
-    func resetLocalUsage(_ tools: [(tool: ToolKind, roots: [String])]) -> Bool {
-        guard !tools.isEmpty else { return false }
+    /// Removes the Claude and Codex sessions whose logs are still on disk and
+    /// rewinds those logs in one transaction. History whose log is gone cannot
+    /// be read back and stays. Callers must first create a backup; the next
+    /// collector scan rebuilds the removed rows.
+    func resetLocalUsage(claudePaths: [String], codexPaths: [String]) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        let targets = rebuildTargets(claudePaths: claudePaths, codexPaths: codexPaths)
         return inTransaction {
-            guard let db = self.db else { return false }
-            var ok = true
-            for spec in tools {
-                let raw = spec.tool.rawValue
-                for table in ["turns", "sessions", "session_totals", "perf_samples"] {
-                    var stmt: OpaquePointer?
-                    let sql = "DELETE FROM \(table) WHERE tool=?;"
-                    if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) != SQLITE_OK {
-                        ok = false
-                        markTransactionWriteFailure()
-                    } else {
-                        sqlite3_bind_text(stmt, 1, (raw as NSString).utf8String, -1, SQLITE_TRANSIENT)
-                        if sqlite3_step(stmt) != SQLITE_DONE {
-                            ok = false
-                            markTransactionWriteFailure()
-                        }
-                    }
-                    sqlite3_finalize(stmt)
-                }
-                for root in spec.roots {
-                    for cursorTable in ["scan_state", "perf_cursors"] {
-                        var stmt: OpaquePointer?
-                        let sql = "DELETE FROM \(cursorTable) WHERE substr(source,1,length(?))=?;"
-                        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) != SQLITE_OK {
-                            ok = false
-                            markTransactionWriteFailure()
-                        } else {
-                            sqlite3_bind_text(stmt, 1, (root as NSString).utf8String, -1, SQLITE_TRANSIENT)
-                            sqlite3_bind_text(stmt, 2, (root as NSString).utf8String, -1, SQLITE_TRANSIENT)
-                            if sqlite3_step(stmt) != SQLITE_DONE {
-                                ok = false
-                                markTransactionWriteFailure()
-                            }
-                        }
-                        sqlite3_finalize(stmt)
-                    }
-                }
+            guard deleteRecountedSessions(prefix: "claude:", sessionIDs: targets.claude),
+                  deleteRecountedSessions(prefix: "codex:", sessionIDs: targets.codex) else {
+                markTransactionWriteFailure()
+                return false
+            }
+            for path in targets.reset where !setScanState(path, size: 0, mtime: 0, identity: 0, context: nil) {
+                return false
             }
             // Deletes do not grow MAX(id); bump the version stamp so the
             // snapshot cache invalidates after a local rebuild.
-            if ok {
-                scanStatesCache = nil
-                bumpDataVersion()
-            }
-            return ok
+            scanStatesCache = nil
+            bumpDataVersion()
+            return true
         }
     }
     /// Clears usage/history tables without touching settings or credentials.
@@ -2493,7 +2630,7 @@ final class Database: @unchecked Sendable {
             return false
         }
         defer { sqlite3_close(handle) }
-        guard sqlite3_exec(handle, "DELETE FROM settings WHERE k IN ('or_keys','openrouter_key','go_auth_cookie','go_workspace_id');",
+        guard sqlite3_exec(handle, "DELETE FROM settings WHERE k IN ('or_keys','openrouter_key','go_auth_cookie','go_workspace_id','remote_feed_url');",
                            nil, nil, nil) == SQLITE_OK else { return false }
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(handle, "VACUUM INTO ?;", -1, &statement, nil) == SQLITE_OK else { return false }
@@ -2799,7 +2936,7 @@ final class Database: @unchecked Sendable {
     /// day grouping stays exact in any time zone.
     static let rollupBucketSeconds: Int64 = 900
     /// Bump when the rollup table or trigger definitions change.
-    private static let rollupSchemaVersion = "1"
+    private static let rollupSchemaVersion = "3"
 
     /// Test hook: false routes every aggregate through raw `turns` rows, the
     /// reference the rollup path must match exactly.
@@ -2812,11 +2949,34 @@ final class Database: @unchecked Sendable {
          "COALESCE(\(row).model, '')",
          "\(row).model IS NULL",
          "\(row).cost_quality",
-         "COALESCE(lower(trim(\(row).provider)) = 'deepseek', 0)"]
+         "COALESCE(lower(trim(\(row).provider)) = 'deepseek', 0)",
+         longPromptSQL(row)]
     }
 
-    private static let rollupKeyColumns = ["bucket", "tool", "model", "model_null", "cost_quality", "deepseek"]
-    private static let rollupSumColumns = ["input_tokens", "output_tokens", "cache_read", "cache_write", "cost"]
+    /// Whether a row's prompt is in its model's long tier. It is part of the
+    /// key because a sum of many prompts cannot tell afterwards. Limited to the
+    /// models that have a tier, so other rows do not split. Same prompt as
+    /// `Pricing.estimate`: Codex input already includes its cache reads.
+    private static func longPromptSQL(_ row: String) -> String {
+        let prompt = """
+        CASE WHEN \(row).tool = 'codex' THEN MAX(\(row).input_tokens, \(row).cache_read) \
+        ELSE \(row).input_tokens + \(row).cache_read END + \(row).cache_write
+        """
+        let longContext = Pricing.longContextModels.map { "\(row).model LIKE '\($0)'" }.joined(separator: " OR ")
+        return """
+        COALESCE(((\(row).model LIKE '%haiku-5-5%' OR \(row).model LIKE '%haiku-5.5%') \
+        AND \(prompt) > \(Pricing.longPromptThreshold)) \
+        OR ((\(longContext)) AND \(prompt) > \(Pricing.longContextThreshold)), 0)
+        """
+    }
+
+    /// `cache_write_1h` is NULL until known, and sums treat that as zero.
+    private static func rollupValue(_ row: String, _ column: String) -> String {
+        column == "cache_write_1h" ? "COALESCE(\(row).\(column), 0)" : "\(row).\(column)"
+    }
+
+    private static let rollupKeyColumns = ["bucket", "tool", "model", "model_null", "cost_quality", "deepseek", "long_prompt"]
+    private static let rollupSumColumns = ["input_tokens", "output_tokens", "cache_read", "cache_write", "cost", "cache_write_1h"]
 
     private static func rollupMatch(_ row: String) -> String {
         zip(rollupKeyColumns, rollupKey(row)).map { "\($0) = (\($1))" }.joined(separator: " AND ")
@@ -2824,7 +2984,7 @@ final class Database: @unchecked Sendable {
 
     private static func rollupAdd(_ row: String) -> String {
         let columns = (rollupKeyColumns + rollupSumColumns + ["n"]).joined(separator: ", ")
-        let values = (rollupKey(row) + rollupSumColumns.map { "\(row).\($0)" } + ["1"]).joined(separator: ", ")
+        let values = (rollupKey(row) + rollupSumColumns.map { rollupValue(row, $0) } + ["1"]).joined(separator: ", ")
         let updates = (rollupSumColumns + ["n"]).map { "\($0) = \($0) + excluded.\($0)" }.joined(separator: ", ")
         return """
         INSERT INTO turn_rollup (\(columns)) VALUES (\(values))
@@ -2833,7 +2993,7 @@ final class Database: @unchecked Sendable {
     }
 
     private static func rollupRemove(_ row: String) -> String {
-        let updates = (rollupSumColumns.map { "\($0) = \($0) - \(row).\($0)" } + ["n = n - 1"])
+        let updates = (rollupSumColumns.map { "\($0) = \($0) - \(rollupValue(row, $0))" } + ["n = n - 1"])
             .joined(separator: ", ")
         return """
         UPDATE turn_rollup SET \(updates) WHERE \(rollupMatch(row));
@@ -2852,11 +3012,13 @@ final class Database: @unchecked Sendable {
           model_null INTEGER NOT NULL,
           cost_quality TEXT NOT NULL,
           deepseek INTEGER NOT NULL,
+          long_prompt INTEGER NOT NULL,
           input_tokens INTEGER NOT NULL,
           output_tokens INTEGER NOT NULL,
           cache_read INTEGER NOT NULL,
           cache_write INTEGER NOT NULL,
           cost REAL NOT NULL,
+          cache_write_1h INTEGER NOT NULL,
           n INTEGER NOT NULL,
           PRIMARY KEY (\(rollupKeyColumns.joined(separator: ", ")))
         ) WITHOUT ROWID;
@@ -2879,7 +3041,7 @@ final class Database: @unchecked Sendable {
         return """
         DELETE FROM turn_rollup;
         INSERT INTO turn_rollup (\((rollupKeyColumns + rollupSumColumns + ["n"]).joined(separator: ", ")))
-        SELECT \(key.joined(separator: ", ")), \(rollupSumColumns.map { "SUM(\($0))" }.joined(separator: ", ")), COUNT(*)
+        SELECT \(key.joined(separator: ", ")), \(rollupSumColumns.map { "SUM(\(rollupValue("turns", $0)))" }.joined(separator: ", ")), COUNT(*)
         FROM turns GROUP BY \(groups);
         """
     }
@@ -2948,12 +3110,12 @@ final class Database: @unchecked Sendable {
         let sql = """
         SELECT COUNT(*) FROM (
           SELECT \(sums.map { "SUM(\($0)) AS \($0)" }.joined(separator: ", ")), SUM(n) AS n FROM (
-            SELECT \(rawKey), \(sums.joined(separator: ", ")), 1 AS n FROM turns
+            SELECT \(rawKey), \(sums.map { "\(Self.rollupValue("turns", $0)) AS \($0)" }.joined(separator: ", ")), 1 AS n FROM turns
             UNION ALL
             SELECT \(keys), \(sums.map { "-\($0)" }.joined(separator: ", ")), -n FROM turn_rollup
           ) GROUP BY \(keys)
         ) WHERE n <> 0 OR input_tokens <> 0 OR output_tokens <> 0
-             OR cache_read <> 0 OR cache_write <> 0 OR abs(cost) > 1e-6;
+             OR cache_read <> 0 OR cache_write <> 0 OR cache_write_1h <> 0 OR abs(cost) > 1e-6;
         """
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return -1 }
@@ -2967,17 +3129,20 @@ final class Database: @unchecked Sendable {
     /// cost, n. Bind with `bindUsageRange`; extra parameters start at ?5.
     private static let usageSource = """
     SELECT bucket, tool, CASE WHEN model_null THEN NULL ELSE model END AS model,
-           cost_quality, deepseek, input_tokens, output_tokens, cache_read, cache_write, cost, n
+           cost_quality, deepseek, input_tokens, output_tokens, cache_read, cache_write, cost, n,
+           cache_write_1h, long_prompt
     FROM turn_rollup WHERE bucket >= ?1 AND bucket < ?2
     UNION ALL
     SELECT ts - ((ts % 900) + 900) % 900, tool, model, cost_quality,
            COALESCE(lower(trim(provider)) = 'deepseek', 0),
-           input_tokens, output_tokens, cache_read, cache_write, cost, 1
+           input_tokens, output_tokens, cache_read, cache_write, cost, 1,
+           COALESCE(cache_write_1h, 0), \(longPromptSQL("turns"))
     FROM turns WHERE ts >= ?3 AND ts < ?1
     UNION ALL
     SELECT ts - ((ts % 900) + 900) % 900, tool, model, cost_quality,
            COALESCE(lower(trim(provider)) = 'deepseek', 0),
-           input_tokens, output_tokens, cache_read, cache_write, cost, 1
+           input_tokens, output_tokens, cache_read, cache_write, cost, 1,
+           COALESCE(cache_write_1h, 0), \(longPromptSQL("turns"))
     FROM turns WHERE ts >= ?2 AND ts <= ?4
     """
 

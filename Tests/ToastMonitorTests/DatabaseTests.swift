@@ -293,18 +293,44 @@ final class DatabaseTests: XCTestCase {
             SessionInfo(tool: .claude, sessionID: "s1", title: nil, project: nil,
                         model: "m", created: 100, updated: 100)
         ]))
-        let preview = db.previewLocalRebuild(tools: [.claude])
+        let preview = db.previewLocalRebuild(claudePaths: ["/tmp/claude-root/s1.jsonl"], codexPaths: [])
         XCTAssertEqual(preview.turns, 1)
         XCTAssertEqual(preview.sessions, 1)
         XCTAssertEqual(preview.tokens, 17)
+        XCTAssertEqual(preview.keptSessions, 0)
 
         let backup = tmpPath + ".backup"
         defer { try? FileManager.default.removeItem(atPath: backup) }
         XCTAssertTrue(db.backup(to: backup))
-        XCTAssertTrue(db.resetLocalUsage([(.claude, ["/tmp/claude-root"])]))
+        XCTAssertTrue(db.resetLocalUsage(claudePaths: ["/tmp/claude-root/s1.jsonl"], codexPaths: []))
         XCTAssertEqual(db.turnCount(), 0)
         XCTAssertTrue(db.restore(from: backup))
         XCTAssertEqual(db.turnCount(), 1)
+    }
+
+    func testRebuildKeepsHistoryWhoseLogIsGoneAndRewindsCowork() {
+        func turn(_ tool: ToolKind, _ sid: String) -> TurnRecord {
+            TurnRecord(tool: tool, sessionID: sid, project: nil, model: "m", ts: 100,
+                       inputTokens: 10, outputTokens: 5, cacheRead: 0, cacheWrite: 0, cost: 1,
+                       eventID: "\(tool.rawValue):\(sid):1")
+        }
+        XCTAssertTrue(db.insertTurns([turn(.claude, "live"), turn(.claude, "gone"), turn(.claude, "cowork"),
+                                      turn(.codex, "codex-live"), turn(.codex, "codex-gone")]))
+        let cowork = "/tmp/Claude/local-agent-mode-sessions/o/p/local_1/.claude/projects/x/cowork.jsonl"
+        let codexLog = "/tmp/rollout-2026-01-01T00-00-00-codex-live.jsonl"
+        XCTAssertTrue(db.setScanState(cowork, size: 1152, mtime: 9, identity: 1))
+        let claude = ["/tmp/projects/x/live.jsonl", cowork]
+
+        let preview = db.previewLocalRebuild(claudePaths: claude, codexPaths: [codexLog])
+        XCTAssertEqual(preview.sessions, 3)
+        XCTAssertEqual(preview.keptSessions, 2)
+        XCTAssertEqual(preview.keptTokens, 30)
+
+        XCTAssertTrue(db.resetLocalUsage(claudePaths: claude, codexPaths: [codexLog]))
+        XCTAssertEqual(db.turnCount(), 2, "only the sessions with no log survive untouched")
+        XCTAssertEqual(db.totals(from: 0, to: .max, tool: .claude).count, 1)
+        XCTAssertEqual(db.totals(from: 0, to: .max, tool: .codex).count, 1)
+        XCTAssertEqual(db.scanState(cowork).size, 0, "Cowork logs must be read again too")
     }
 
     func testDailyAggregatesCountCallsRatherThanDays() {
@@ -706,36 +732,156 @@ final class DatabaseTests: XCTestCase {
         return String(cString: rawText)
     }
 
-    func testBackfillRepricesAStaleEstimate() {
-        let stale = TurnRecord(tool: .codex, sessionID: "s", project: nil, model: "gpt-5-mini", ts: 10,
-                               inputTokens: 1_000_000, outputTokens: 0, cacheRead: 0, cacheWrite: 0,
-                               cost: 9, pricingVersion: "1999-01-01", eventID: "codex:s:old")
-        XCTAssertTrue(db.insertTurns([stale]))
+    func testBumpingThePriceTableLeavesStoredCostsAlone() {
+        let priced = TurnRecord(tool: .codex, sessionID: "s", project: nil, model: "gpt-5-mini", ts: 10,
+                                inputTokens: 1_000_000, outputTokens: 0, cacheRead: 0, cacheWrite: 0,
+                                cost: 9, pricingVersion: "1999-01-01", eventID: "codex:s:old")
+        XCTAssertTrue(db.insertTurns([priced]))
         db.setSetting("backfill_costs_last", nil)
         db.backfillCosts()
-        let stored = db.turns(sessionTool: "codex", sessionID: "s")
-        XCTAssertEqual(stored.count, 1)
-        XCTAssertEqual(stored[0].cost, 0.25, accuracy: 0.0001)
+        XCTAssertEqual(db.turns(sessionTool: "codex", sessionID: "s")[0].cost, 9, accuracy: 0.0001)
     }
 
-    func testOpenRouterCycleSpendSubtractsMiddayBaseline() {
-        let day = Int64(2_000_000_000 / 86400) * 86400
-        XCTAssertTrue(db.insertORSnapshot(.init(ts: day + 100, usage: 0, usageDaily: 2,
-                                                usageWeekly: 2, usageMonthly: 2, limit: nil,
-                                                limitRemaining: nil, limitReset: nil, isFreeTier: false,
-                                                creditsTotal: nil, creditsUsage: nil, accountUsage: nil,
-                                                accountBalance: nil, isManagementKey: false)))
-        XCTAssertTrue(db.insertORSnapshot(.init(ts: day + 5_000, usage: 0, usageDaily: 5,
-                                                usageWeekly: 5, usageMonthly: 5, limit: nil,
-                                                limitRemaining: nil, limitReset: nil, isFreeTier: false,
-                                                creditsTotal: nil, creditsUsage: nil, accountUsage: nil,
-                                                accountBalance: nil, isManagementKey: false)))
-        XCTAssertTrue(db.insertORSnapshot(.init(ts: day + 86_500, usage: 0, usageDaily: 4,
-                                                usageWeekly: 4, usageMonthly: 4, limit: nil,
-                                                limitRemaining: nil, limitReset: nil, isFreeTier: false,
-                                                creditsTotal: nil, creditsUsage: nil, accountUsage: nil,
-                                                accountBalance: nil, isManagementKey: false)))
-        XCTAssertEqual(db.orSpendSince(day + 2_000), 7, accuracy: 0.0001)
+    func testBackfillCorrectsOnlyModelsWithAWrongTableEntry() {
+        let wrong = TurnRecord(tool: .codex, sessionID: "s", project: nil, model: "gpt-5.6-sol", ts: 10,
+                               inputTokens: 1_000_000, outputTokens: 0, cacheRead: 0, cacheWrite: 0,
+                               cost: 1.25, pricingVersion: "2026-10-27", eventID: "codex:s:1")
+        XCTAssertTrue(db.insertTurns([wrong]))
+        db.setSetting("backfill_costs_last", nil)
+        db.backfillCosts()
+        XCTAssertEqual(db.turns(sessionTool: "codex", sessionID: "s")[0].cost, 4, accuracy: 0.0001)
+    }
+
+    func testStoredCostsDoNotTakeOnTheLongContextCharge() {
+        func turn(_ sid: String, _ model: String, cost: Double, version: String?) -> TurnRecord {
+            TurnRecord(tool: .opencode, sessionID: sid, project: nil, model: model, ts: 10,
+                       inputTokens: 1_000_000, outputTokens: 0, cacheRead: 0, cacheWrite: 0,
+                       cost: cost, pricingVersion: version, eventID: "opencode:\(sid):1")
+        }
+        XCTAssertTrue(db.insertTurns([turn("past", "gpt-6.1-sol", cost: 2, version: "2026-10-27"),
+                                      turn("unpriced", "gpt-6.1-sol", cost: 0, version: nil)]))
+        db.setSetting("backfill_costs_last", nil)
+        db.backfillCosts()
+        XCTAssertEqual(db.turns(sessionTool: "opencode", sessionID: "past")[0].cost, 2, accuracy: 0.0001)
+        XCTAssertEqual(db.turns(sessionTool: "opencode", sessionID: "unpriced")[0].cost, 4, accuracy: 0.0001)
+        XCTAssertEqual(db.apiValue(from: 0, to: .max), 8, accuracy: 0.0001, "Value uses today's prices")
+    }
+
+    func testCorrectionKeepsOneHourWritesAndSkipsUnknownSplits() {
+        func turn(_ sid: String, split: Int64?) -> TurnRecord {
+            TurnRecord(tool: .claude, sessionID: sid, project: nil, model: "claude-sonnet-5-5", ts: 10,
+                       inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheWrite: 1_000_000,
+                       cacheWrite1h: split, cost: 3.7, pricingVersion: "2026-10-27", eventID: "claude:\(sid):1")
+        }
+        XCTAssertTrue(db.insertTurns([turn("known", split: 800_000), turn("unknown", split: nil)]))
+        db.setSetting("backfill_costs_last", nil)
+        db.backfillCosts()
+        XCTAssertEqual(db.turns(sessionTool: "claude", sessionID: "known")[0].cost,
+                       0.2 * 2.5 + 0.8 * 4, accuracy: 0.0001, "one-hour writes cost 2× input")
+        XCTAssertEqual(db.turns(sessionTool: "claude", sessionID: "unknown")[0].cost, 3.7, accuracy: 0.0001,
+                       "the five-minute rate would silently lower this")
+    }
+
+    func testReplayFillsTheOneHourShareWithoutAddingRows() {
+        let old = TurnRecord(tool: .claude, sessionID: "s", project: nil, model: "claude-opus-5-5", ts: 10,
+                             inputTokens: 1, outputTokens: 1, cacheRead: 0, cacheWrite: 1_000, cost: 1,
+                             pricingVersion: "2026-10-27", eventID: "claude:s:m", usageMerge: .keepGreater)
+        XCTAssertTrue(db.insertTurns([old]))
+        XCTAssertEqual(db.setting("cache_split_replay"), "pending")
+        XCTAssertTrue(db.setScanState("/tmp/s.jsonl", size: 10, mtime: 1, identity: 1))
+        db.replayClaudeForCacheSplit(paths: ["/tmp/s.jsonl"])
+        XCTAssertEqual(db.scanState("/tmp/s.jsonl").size, 0)
+        XCTAssertEqual(db.setting("cache_split_replay"), "done")
+        XCTAssertTrue(db.setScanState("/tmp/s.jsonl", size: 10, mtime: 1, identity: 1))
+        db.replayClaudeForCacheSplit(paths: ["/tmp/s.jsonl"])
+        XCTAssertEqual(db.scanState("/tmp/s.jsonl").size, 10, "runs once")
+
+        let parsed = TurnRecord(tool: .claude, sessionID: "s", project: nil, model: "claude-opus-5-5", ts: 10,
+                                inputTokens: 1, outputTokens: 1, cacheRead: 0, cacheWrite: 1_000,
+                                cacheWrite1h: 1_000, cost: 0.008, eventID: "claude:s:m", usageMerge: .keepGreater)
+        XCTAssertTrue(db.insertTurns([parsed]))
+        XCTAssertEqual(db.turnCount(), 1)
+        XCTAssertEqual(db.turns(sessionTool: "claude", sessionID: "s")[0].cost, 0.008, accuracy: 0.00001)
+        XCTAssertEqual(db.rollupMismatchCount(), 0)
+    }
+
+    /// Value and Estimated Cost must agree: same split and tier, row or sum.
+    func testAPIValueMatchesPerRowPricingAcrossTiers() {
+        func turn(_ i: Int, input: Int64, read: Int64, write: Int64, write1h: Int64) -> TurnRecord {
+            let cost = Pricing.estimate(model: "claude-haiku-5-5", input: input, output: 10, cacheRead: read,
+                                        cacheWrite: write - write1h, cacheWrite1h: write1h)!
+            return TurnRecord(tool: .claude, sessionID: "s", project: nil, model: "claude-haiku-5-5", ts: 1_000 + Int64(i),
+                              inputTokens: input, outputTokens: 10, cacheRead: read, cacheWrite: write,
+                              cacheWrite1h: write1h, cost: cost, eventID: "claude:s:\(i)")
+        }
+        let rows = [turn(0, input: 10, read: 50_000, write: 1_000, write1h: 500),
+                    turn(1, input: 10, read: 150_000, write: 1_000, write1h: 1_000),
+                    turn(2, input: 90_000, read: 9_000, write: 2_000, write1h: 0)]
+        XCTAssertTrue(db.insertTurns(rows))
+        let expected = rows.reduce(0) { $0 + $1.cost }
+        XCTAssertEqual(db.apiValue(from: 0, to: .max), expected, accuracy: 1e-9)
+        XCTAssertEqual(db.apiValue(from: 1_000, to: 1_001, tool: "claude"), rows[0].cost + rows[1].cost, accuracy: 1e-9)
+        XCTAssertEqual(db.rollupMismatchCount(), 0)
+    }
+
+    /// Value reads grouped sums, so each GPT model's tier must be in the rollup
+    /// key, with Codex cache reads counted once as they are per row.
+    func testAPIValueMatchesPerRowPricingForGPTLongContext() {
+        func turn(_ i: Int, _ tool: ToolKind, _ model: String, input: Int64, read: Int64) -> TurnRecord {
+            let cost = Pricing.estimate(model: model, input: input, output: 1_000, cacheRead: read, cacheWrite: 0,
+                                        inputIncludesCache: tool == .codex)!
+            return TurnRecord(tool: tool, sessionID: "s", project: nil, model: model, ts: 1_000 + Int64(i),
+                              inputTokens: input, outputTokens: 1_000, cacheRead: read, cacheWrite: 0,
+                              cost: cost, eventID: "\(tool.rawValue):s:\(i)")
+        }
+        let models = ["gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna",
+                      "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4", "openai/GPT-6.1-Sol"]
+        var rows: [TurnRecord] = []
+        for model in models {
+            let i = rows.count
+            rows += [turn(i, .codex, model, input: 200_000, read: 150_000),
+                     turn(i + 1, .codex, model, input: 300_000, read: 290_000),
+                     turn(i + 2, .opencode, model, input: 200_000, read: 150_000),
+                     turn(i + 3, .opencode, model, input: 100_000, read: 150_000)]
+        }
+        XCTAssertTrue(db.insertTurns(rows))
+        let expected = rows.reduce(0) { $0 + $1.cost }
+        XCTAssertEqual(db.apiValue(from: 0, to: .max), expected, accuracy: 1e-9)
+        db.aggregatesUseRollup = false
+        XCTAssertEqual(db.apiValue(from: 0, to: .max), expected, accuracy: 1e-9)
+        db.aggregatesUseRollup = true
+        XCTAssertEqual(db.rollupMismatchCount(), 0)
+    }
+
+    func testSessionWithoutADateUsesItsLastTurnAndStubsAreHidden() {
+        func session(_ id: String) -> SessionInfo {
+            SessionInfo(tool: .codex, sessionID: id, title: nil, project: nil, model: nil, created: 0, updated: 0)
+        }
+        XCTAssertTrue(db.upsertSessions([session("used"), session("stub")]))
+        XCTAssertTrue(db.insertTurns([TurnRecord(tool: .codex, sessionID: "used", project: nil, model: "m", ts: 5_000,
+                                                 inputTokens: 1, outputTokens: 1, cacheRead: 0, cacheWrite: 0,
+                                                 cost: 0, eventID: "e1")]))
+        let rows = db.sessions()
+        XCTAssertEqual(rows.map(\.sessionID), ["used"])
+        XCTAssertEqual(rows.first?.updated, 5_000)
+        XCTAssertEqual(db.sessionCount(), 1)
+        XCTAssertEqual(db.sessionCount(tool: .claude), 0)
+    }
+
+    func testCodexCoveredBySubscriptionCostsNothingEverywhere() {
+        let now = Int64(Date().timeIntervalSince1970)
+        XCTAssertTrue(db.upsertSessions([SessionInfo(tool: .codex, sessionID: "s", title: nil, project: nil,
+                                                     model: "m", created: now, updated: now)]))
+        XCTAssertTrue(db.insertTurns([TurnRecord(tool: .codex, sessionID: "s", project: nil, model: "m", ts: now,
+                                                 inputTokens: 1, outputTokens: 1, cacheRead: 0, cacheWrite: 0,
+                                                 cost: 5, eventID: "e1")]))
+        XCTAssertEqual(db.modelAggregates(from: 0, to: .max).first?.cost ?? 0, 5, accuracy: 0.001)
+        db.setSetting("codex_billing_mode", "subscription")
+        XCTAssertEqual(db.modelAggregates(from: 0, to: .max).first?.cost ?? 1, 0, accuracy: 0.001)
+        XCTAssertEqual(db.dailyAggregates(days: 2).first?.cost ?? 1, 0, accuracy: 0.001)
+        XCTAssertEqual(db.dailyAggregatesByModel(days: 2).first?.cost ?? 1, 0, accuracy: 0.001)
+        XCTAssertEqual(db.sessions().first?.cost ?? 1, 0, accuracy: 0.001)
+        XCTAssertEqual(db.turns(sessionTool: "codex", sessionID: "s").first?.cost ?? 1, 0, accuracy: 0.001)
     }
 
     // P0-9: 两条 id=0 订阅不得互相覆盖。
@@ -852,7 +998,8 @@ extension DatabaseTests {
         XCTAssertTrue(db.insertTurns([codex, claude]))
         let keyAfterInsert = db.dataVersionKey()
 
-        XCTAssertTrue(db.resetLocalUsage([(.codex, ["/tmp/codex-roots"])]))
+        XCTAssertTrue(db.resetLocalUsage(claudePaths: [],
+                                         codexPaths: ["/tmp/rollout-2026-01-01T00-00-00-s-codex.jsonl"]))
         XCTAssertNotEqual(db.dataVersionKey(), keyAfterInsert,
                           "resetLocalUsage must invalidate the snapshot cache key (DB-1)")
 
@@ -1058,26 +1205,4 @@ extension DatabaseTests {
         XCTAssertEqual(remaining.first?.ts, now)
     }
 
-    /// DB-8: on the first day of a cycle there may be no same-day snapshot
-    /// before the cycle start; the baseline must come from the most recent
-    /// snapshot on ANY earlier day (else pre-cycle usage is double-counted).
-    func testOrSpendBaselineFallsBackToPriorDaySnapshot() {
-        let day0 = Int64(2_000_000_000 / 86400) * 86400
-        let day1 = day0 + 86400
-        let snap = { (ts: Int64, daily: Double) in
-            Database.ORSnapshot(ts: ts, usage: 0, usageDaily: daily, usageWeekly: daily,
-                                usageMonthly: daily, limit: nil, limitRemaining: nil, limitReset: nil,
-                                isFreeTier: false, creditsTotal: nil, creditsUsage: nil,
-                                accountUsage: nil, accountBalance: nil, isManagementKey: false)
-        }
-        // No snapshot on day1 before the cycle start: the baseline must come
-        // from day0 (usage_daily 3). First-day contribution = 7 - 3 = 4.
-        // Old behavior (same-day-only baseline) would count the full 7.
-        XCTAssertTrue(db.insertORSnapshot(snap(day0 + 100, 3)))   // prior day: baseline source
-        XCTAssertTrue(db.insertORSnapshot(snap(day1 + 5_000, 7))) // cycle-start day, after start
-        XCTAssertEqual(db.orSpendSince(day1 + 2_000), 4, accuracy: 0.0001)
-
-        // With no snapshots after the start there is nothing to sum.
-        XCTAssertEqual(db.orSpendSince(day1 + 50_000), 0, accuracy: 0.0001)
-    }
 }

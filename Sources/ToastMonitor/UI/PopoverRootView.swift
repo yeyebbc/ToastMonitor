@@ -5,6 +5,7 @@ import AppKit
 /// tools, sessions and settings belong to the dashboard, not to a tiny window
 /// opened for a quick glance.
 struct PopoverRootView: View {
+    @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var app = AppState.shared
     @ObservedObject private var health = SourceHealthHub.shared
 
@@ -27,6 +28,9 @@ struct PopoverRootView: View {
         // pinned to the menu-bar edge so extra height is revealed downward.
         .frame(maxHeight: .infinity, alignment: .top)
         .environment(\.controlSize, .small)
+        // Over a bright desktop the dark material turns mid-gray, and text on
+        // it fell under 3:1. This keeps a dark panel dark.
+        .background(Color.black.opacity(colorScheme == .dark ? 0.3 : 0))
         .onPreferenceChange(PopoverHeightPreferenceKey.self) { measurements in
             guard let naturalHeight = measurements.naturalHeight else { return }
             onNaturalHeightChange(naturalHeight)
@@ -57,6 +61,8 @@ struct PopoverRootView: View {
                     Image(systemName: "arrow.clockwise")
                 }
             }
+            .frame(minWidth: 24, minHeight: 24)
+            .contentShape(Rectangle())
             .buttonStyle(.borderless)
             .disabled(app.manualRefreshing)
             .help("Refresh data")
@@ -129,14 +135,7 @@ struct PopoverRootView: View {
     }
 
     private func refresh() {
-        DeepSeekBillingClient.shared.refresh(force: true)
-        app.refresh(manual: true)
-        CollectorEngine.shared.scheduleScan()
-        OpenRouterClient.shared.refresh()
-        OpenCodeGoClient.shared.refresh()
-        CodexQuotaClient.shared.refresh()
-        ClaudeQuotaClient.shared.refresh(force: true)
-        HermesRemoteClient.shared.maybePoll()
+        app.refreshAllSources()
     }
 }
 

@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import Security
 
 /// Delegates Claude Code's OAuth token refresh to the real `claude` CLI
 /// instead of ToastMonitor implementing an OAuth refresh flow of its own.
@@ -33,15 +34,20 @@ enum ClaudeCLIRefresher {
     ]
 
     private static let probeTimeout: TimeInterval = 25
-    /// Don't spawn a probe more often than this even if a caller keeps
-    /// asking — e.g. the token stays expired because the user is genuinely
-    /// logged out, not just idle. A whole `claude` session is heavier than
-    /// a network request; this keeps a stuck state from repeatedly spawning
-    /// one on every refresh cycle.
-    private static let minReinvokeInterval: TimeInterval = 10 * 60
+    /// Each check re-reads the login, which can start /usr/bin/security.
+    private static let renewedCheckInterval: TimeInterval = 3
+    private static let gate = CLIRenewalGate()
 
-    private static var lastInvoke: TimeInterval = 0
+    private static var attempt = 0
     private static let lock = NSLock()
+
+    /// `--tools ""` disables the tool list. The probe still uses the user's
+    /// Claude login; CLAUDE_CONFIG_DIR is left unset on purpose. A failed
+    /// login retries every minute, and a normal start launches every
+    /// configured MCP server, so most retries skip them.
+    nonisolated static func arguments(attempt: Int) -> [String] {
+        attempt % 5 == 0 ? ["--tools", ""] : ["--tools", "", "--strict-mcp-config"]
+    }
 
     /// Finds a `claude` executable without shelling out when possible.
     /// Returns nil if none is found — callers should fall back to the
@@ -55,7 +61,9 @@ enum ClaudeCLIRefresher {
                                          home: String = NSHomeDirectory(),
                                          fixedCandidates: [String]? = nil) -> String? {
         let fixed = fixedCandidates ?? ["/opt/homebrew/bin/\(name)", "/usr/local/bin/\(name)"]
-        let candidates = ["\(home)/.local/bin/\(name)"] + fixed
+        // ~/.grok/bin is where Grok's own installer puts it; an app opened
+        // from Finder doesn't get the PATH line that installer adds.
+        let candidates = ["\(home)/.local/bin/\(name)", "\(home)/.\(name)/bin/\(name)"] + fixed
         for path in candidates where FileManager.default.isExecutableFile(atPath: path) {
             return path
         }
@@ -79,6 +87,26 @@ enum ClaudeCLIRefresher {
         return quarantineBlocksLaunch(String(decoding: buffer, as: UTF8.self))
     }
 
+    /// True when launching the file from this app would raise a Gatekeeper
+    /// dialog: quarantined and not notarized. Homebrew re-quarantines a cask
+    /// on every upgrade and a Terminal run never clears the flag, so blocking
+    /// notarized builds too stopped renewals for good after each upgrade.
+    nonisolated static func launchBlocked(_ path: String) -> Bool {
+        isQuarantined(path) && !isNotarized(path)
+    }
+
+    /// Checks the notarization ticket (stapled, or online); may block briefly.
+    nonisolated static func isNotarized(_ path: String) -> Bool {
+        let url = URL(fileURLWithPath: path).resolvingSymlinksInPath() as CFURL
+        var code: SecStaticCode?
+        var requirement: SecRequirement?
+        guard SecStaticCodeCreateWithPath(url, [], &code) == errSecSuccess, let code,
+              SecRequirementCreateWithString("notarized" as CFString, [], &requirement) == errSecSuccess,
+              let requirement else { return false }
+        return SecStaticCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSCheckAllArchitectures),
+                                          requirement) == errSecSuccess
+    }
+
     /// The xattr reads "flags;timestamp;agent;uuid" with hex flags; 0x40
     /// marks a file the user already approved to open.
     nonisolated static func quarantineBlocksLaunch(_ value: String) -> Bool {
@@ -88,27 +116,45 @@ enum ClaudeCLIRefresher {
     }
 
     /// Runs the probe synchronously — this blocks for up to ~25s and must
-    /// never be called on the main actor. Returns true only once `/status`
-    /// visibly rendered account info, which is the signal Claude Code's own
-    /// login check (and refresh, if the token had expired) completed.
-    @discardableResult
-    nonisolated static func refresh(binary: String? = nil) -> Bool {
+    /// never be called on the main actor. Ends as soon as `renewed` reports
+    /// the new login, or once `/status` visibly rendered account info, which
+    /// is the signal Claude Code's own login check completed.
+    nonisolated static func refresh(binary: String? = nil,
+                                    renewed: (@Sendable () -> Bool)? = nil) -> CLIRenewalOutcome {
+        guard gate.begin() else { return .throttled }
         lock.lock()
-        let now = Date().timeIntervalSince1970
-        guard now - lastInvoke >= minReinvokeInterval else { lock.unlock(); return false }
-        lastInvoke = now
+        let currentAttempt = attempt
+        attempt += 1
         lock.unlock()
+        let outcome = probe(binary: binary, attempt: currentAttempt, renewed: renewed)
+        if case .failed(let reason) = outcome {
+            NSLog("[ToastMonitor][renewal] claude attempt %d failed: %@", currentAttempt, reason)
+        }
+        return outcome
+    }
 
-        guard let binary = binary ?? locateBinary() else { return false }
-        // A freshly installed or upgraded `claude` (e.g. a Homebrew cask)
-        // carries an unapproved quarantine flag. Launching it from this app
-        // makes Gatekeeper put up a "cannot verify" dialog on every attempt,
-        // while a Terminal run is exempt — so leave it to the user there.
-        guard !isQuarantined(binary) else { return false }
+    /// The next renewal, hours away, starts over with the full launch.
+    nonisolated static func renewalSucceeded() {
+        lock.lock()
+        let attempts = attempt
+        attempt = 0
+        lock.unlock()
+        if attempts > 1 {
+            NSLog("[ToastMonitor][renewal] claude renewed on attempt %d", attempts - 1)
+        }
+    }
+
+    nonisolated static func probe(binary: String?, attempt: Int,
+                                  renewed: (@Sendable () -> Bool)?) -> CLIRenewalOutcome {
+        guard let binary = binary ?? locateBinary() else { return .failed("binary not found") }
+        // A quarantined build that is not notarized makes Gatekeeper put up
+        // a "cannot verify" dialog on every attempt, while a Terminal run is
+        // exempt — so leave that one to the user there.
+        guard !launchBlocked(binary) else { return .failed("blocked by Gatekeeper") }
 
         var masterFD: Int32 = 0
         var slaveFD: Int32 = 0
-        guard openpty(&masterFD, &slaveFD, nil, nil, nil) == 0 else { return false }
+        guard openpty(&masterFD, &slaveFD, nil, nil, nil) == 0 else { return .failed("no PTY") }
 
         // A dedicated scratch directory: this must never run inside one of
         // the user's real projects (wrong trust prompts, wrong CLAUDE.md,
@@ -125,9 +171,7 @@ enum ClaudeCLIRefresher {
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: binary)
-        // `--tools ""` disables the tool list. The probe still uses the
-        // user's Claude login; CLAUDE_CONFIG_DIR is left unset on purpose.
-        process.arguments = ["--tools", ""]
+        process.arguments = arguments(attempt: attempt)
         process.currentDirectoryURL = probeDir
         let slaveHandle = FileHandle(fileDescriptor: slaveFD, closeOnDealloc: false)
         process.standardInput = slaveHandle
@@ -139,7 +183,7 @@ enum ClaudeCLIRefresher {
         } catch {
             close(masterFD)
             close(slaveFD)
-            return false
+            return .failed("launch: \(error.localizedDescription)")
         }
         close(slaveFD) // the child holds its own copy; the parent's is done
 
@@ -153,13 +197,32 @@ enum ClaudeCLIRefresher {
         var nudgedAfterStatus = false
         var scanFrom = 0
         var succeeded = false
+        var exitedEarly = false
+        var nextRenewedCheck = Date().addingTimeInterval(renewedCheckInterval)
 
         while Date() < deadline {
+            if let renewed, Date() >= nextRenewedCheck {
+                if renewed() {
+                    succeeded = true
+                    break
+                }
+                nextRenewedCheck = Date().addingTimeInterval(renewedCheckInterval)
+            }
             var pfd = pollfd(fd: masterFD, events: Int16(POLLIN), revents: 0)
+            var gotOutput = false
             if poll(&pfd, 1, 80) > 0, Int32(pfd.revents) & POLLIN != 0 {
                 var chunk = [UInt8](repeating: 0, count: 8192)
                 let n = read(masterFD, &chunk, chunk.count)
-                if n > 0 { buffer.append(contentsOf: chunk[0..<n]) }
+                if n > 0 {
+                    buffer.append(contentsOf: chunk[0..<n])
+                    gotOutput = true
+                }
+            }
+            // With the CLI gone and its output drained, poll returns at once,
+            // so carrying on would spin a core until the deadline.
+            if !gotOutput, !process.isRunning {
+                exitedEarly = true
+                break
             }
             let fresh = buffer.dropFirst(min(scanFrom, buffer.count))
             let scan = compact(Array(fresh.suffix(20_000)))
@@ -193,7 +256,9 @@ enum ClaudeCLIRefresher {
         }
         if process.isRunning { kill(process.processIdentifier, SIGKILL) }
         close(masterFD)
-        return succeeded
+        if succeeded { return .completed }
+        return .failed(exitedEarly ? "exited with status \(process.terminationStatus)"
+                                   : "no account info within \(Int(probeTimeout))s")
     }
 
     private static func writeToFD(_ fd: Int32, _ text: String) {
@@ -206,8 +271,10 @@ enum ClaudeCLIRefresher {
     /// anywhere in the recent output" check the probe relies on — exact
     /// spacing/formatting in Claude Code's TUI output isn't something to
     /// depend on.
-    private static func compact(_ bytes: [UInt8]) -> String {
-        guard let text = String(bytes: bytes, encoding: .utf8) else { return "" }
+    static func compact(_ bytes: [UInt8]) -> String {
+        // The scan window can start or end inside a multibyte character; a
+        // strict decode would blank the whole window until more output came.
+        let text = String(decoding: bytes, as: UTF8.self)
         var out = ""
         out.reserveCapacity(text.count)
         var iterator = text.unicodeScalars.makeIterator()

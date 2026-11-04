@@ -1,6 +1,41 @@
 import AppKit
 import Foundation
 
+/// Retry pacing for collector sources. A source that keeps failing is
+/// reparsed in full on every tick because its cursor never advances, so
+/// after a few failures in a row it waits out a growing delay. One failure
+/// alone (a log written mid-parse) still retries on the next tick.
+struct SourceRetry {
+    static let failuresBeforeBackoff = 3
+    private var failures: [String: Int] = [:]
+    private var backoff: [String: RefreshBackoff] = [:]
+
+    func isWaiting(_ source: String,
+                   now: TimeInterval = ProcessInfo.processInfo.systemUptime) -> Bool {
+        (backoff[source]?.nextAllowed ?? 0) > now
+    }
+
+    mutating func failed(_ source: String,
+                         now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+        let count = (failures[source] ?? 0) + 1
+        failures[source] = count
+        if count >= Self.failuresBeforeBackoff {
+            backoff[source, default: RefreshBackoff()].failed(now: now)
+        }
+    }
+
+    mutating func succeeded(_ source: String) {
+        failures[source] = nil
+        backoff[source] = nil
+    }
+
+    /// A user refresh retries every source immediately; a source that fails
+    /// again resumes its growing delay.
+    mutating func retryNow() {
+        for key in backoff.keys { backoff[key]?.allowNow() }
+    }
+}
+
 /// Orchestrates collection. The loop is 1s while a panel is open, 5s in the
 /// background, 30s after an idle scan, and 60s on low power. Sleep pauses it.
 /// Per-file stat checks keep an idle pass cheap and avoid FSEvents feedback
@@ -54,6 +89,7 @@ final class CollectorEngine: @unchecked Sendable {
     private var lastScanWasIdle = false
     private var installedInterval: TimeInterval = 0
     private var pausedForSleep = false
+    private var sourceRetry = SourceRetry()
 
     private func sourceSignature(_ path: String) -> String? {
         guard let main = FileScanner.fileStat(path) else { return nil }
@@ -72,13 +108,34 @@ final class CollectorEngine: @unchecked Sendable {
         }
     }
 
+    /// Logs that end in a partial line, as of the scan that could not finish
+    /// them. The cursor stays before that line, so size alone reads as a change
+    /// and the same bytes would be parsed and written on every tick.
+    private var settledPartialTails: [String: (stat: FileScanner.Stat, cursor: Int64)] = [:]
+
     private func fileSourcesChanged(_ paths: [String]) -> Bool {
         paths.contains { path in
             guard let stat = FileScanner.fileStat(path) else { return false }
             let previous = Database.shared.scanState(path)
+            // A rebuild moves the cursor without touching the file.
+            if let settled = settledPartialTails[path], settled.cursor == previous.size,
+               settled.stat.size == stat.size, settled.stat.mtime == stat.mtime,
+               settled.stat.identity == stat.identity { return false }
             return previous.size != stat.size
                 || previous.mtime != stat.mtime
                 || previous.identity != stat.identity
+        }
+    }
+
+    private func notePartialTails(_ paths: [String]) {
+        for path in paths {
+            guard let stat = FileScanner.fileStat(path) else { continue }
+            let state = Database.shared.scanState(path)
+            if state.size < stat.size, state.mtime == stat.mtime, state.identity == stat.identity {
+                settledPartialTails[path] = (stat, state.size)
+            } else {
+                settledPartialTails[path] = nil
+            }
         }
     }
 
@@ -171,6 +228,8 @@ final class CollectorEngine: @unchecked Sendable {
                       completion: (@MainActor @Sendable (ScanReceipt) -> Void)? = nil) -> UUID {
         let requestID = UUID()
         queue.async { [self] in
+            // Every caller is a user refresh: retry failing sources now.
+            sourceRetry.retryNow()
             if force {
                 pending = false
                 runScan(requestID: requestID, completion: completion)
@@ -204,6 +263,7 @@ final class CollectorEngine: @unchecked Sendable {
                     scan: (any ParserStateStore) -> (turns: [TurnRecord], sessions: [SessionInfo]),
                     signaturePath: String? = nil, signaturePaths: [String] = []) {
             let sourceStart = CFAbsoluteTimeGetCurrent()
+            if sourceRetry.isWaiting(source) { return }
             guard preflight() else {
                 let duration = (CFAbsoluteTimeGetCurrent() - sourceStart) * 1000
                 Task { @MainActor in
@@ -220,6 +280,7 @@ final class CollectorEngine: @unchecked Sendable {
             let duration = (CFAbsoluteTimeGetCurrent() - sourceStart) * 1000
             if let problem = prepared.problem {
                 failedSources.append(source)
+                sourceRetry.failed(source)
                 Task { @MainActor in
                     SourceHealthHub.shared.record(tool: source, rows: turnRows,
                                                   failed: max(turnRows, 1), durationMs: duration,
@@ -229,6 +290,7 @@ final class CollectorEngine: @unchecked Sendable {
             }
             if !prepared.committed {
                 failedSources.append(source)
+                sourceRetry.failed(source)
                 Task { @MainActor in
                     SourceHealthHub.shared.record(tool: source, rows: turnRows,
                                                   failed: max(turnRows, 1), durationMs: duration,
@@ -236,6 +298,8 @@ final class CollectorEngine: @unchecked Sendable {
                 }
                 return
             }
+            sourceRetry.succeeded(source)
+            notePartialTails(sourcePaths.filter { $0.hasSuffix(".jsonl") })
             for path in [signaturePath].compactMap({ $0 }) + signaturePaths { rememberSource(path) }
             if turnRows == 0 && sessionRows == 0 {
                 Task { @MainActor in
@@ -262,6 +326,8 @@ final class CollectorEngine: @unchecked Sendable {
             claudePaths: ToolKind.claude.sourceIsRemote ? [] : claudeFiles,
             codexPaths: ToolKind.codex.sourceIsRemote ? [] : codexFiles,
             dshPaths: dshLogFiles)
+        Database.shared.replayClaudeForCacheSplit(
+            paths: ToolKind.claude.sourceIsRemote ? [] : claudeFiles)
 
         ingest("claude", preflight: { self.fileSourcesChanged(claudeFiles) },
                sourcePaths: claudeFiles) { state in
@@ -327,7 +393,7 @@ final class CollectorEngine: @unchecked Sendable {
         }
 
         let elapsed = CFAbsoluteTimeGetCurrent() - t0
-        if turnCount > 0 || sessionCount > 0 || elapsed > 0.05 {
+        if turnCount > 0 || sessionCount > 0 || elapsed > 1 {
             NSLog("[ToastMonitor] scan: %d turns, %d sessions, %.1fms",
                   turnCount, sessionCount, elapsed * 1000)
         }

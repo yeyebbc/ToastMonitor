@@ -139,7 +139,7 @@ struct AccountsSettingsSection: View {
             account("codex", "Codex", symbol: ToolKind.codex.symbol, color: ToolKind.codex.color,
                     status: codexQuota.enabled
                         ? (codexQuota.state.lastSync > 0 ? "Connected" : "Not connected")
-                        : "Off") {
+                        : "Not connected") {
                 Toggle("Read Codex quota", isOn: Binding(
                     get: { codexQuota.enabled },
                     set: { codexQuota.setEnabled($0) }
@@ -232,9 +232,12 @@ struct AccountsSettingsSection: View {
                 Text(status)
             } label: {
                 HStack(spacing: 8) {
+                    // Decorative: the system would read its symbol name, such
+                    // as "off" for Grok's mark.
                     Image(systemName: symbol)
                         .foregroundStyle(color)
                         .frame(width: 18)
+                        .accessibilityHidden(true)
                     Text(title)
                 }
             }
@@ -267,13 +270,13 @@ struct AccountsSettingsSection: View {
     }
 
     private var claudeStatus: String {
-        guard claudeQuota.enabled else { return "Off" }
+        guard claudeQuota.enabled else { return "Not connected" }
         if claudeQuota.state.error != nil { return "Error" }
         return claudeQuota.state.configured || claudeQuota.state.lastSync > 0 ? "Connected" : "Not signed in"
     }
 
     private var grokStatus: String {
-        guard grokQuota.enabled else { return "Off" }
+        guard grokQuota.enabled else { return "Not connected" }
         let state = grokQuota.state
         if state.error != nil && state.configured { return "Error" }
         guard state.configured else { return "Not signed in" }

@@ -186,21 +186,26 @@ struct PopoverHomeView: View {
                     ScrollViewReader { scroller in
                         ScrollView(.vertical, showsIndicators: false) {
                             VStack(alignment: .leading, spacing: 10) {
+                                if let problem = app.databaseProblem {
+                                    PopoverCard(title: "") { DatabaseProblemView(problem: problem) }
+                                }
                                 // Everything the period selector changes lives in
                                 // this one card; Quota and Balance below are
                                 // current state and sit outside it.
                                 // The selector heads the card instead of a title: it
                                 // names what the card shows and has the full width.
-                                PopoverCard(title: "") {
-                                    VStack(alignment: .leading, spacing: 14) {
-                                        periodControl
-                                        hero
-                                        if !isSectionHidden("sources") { sourceBar }
+                                if app.databaseProblem == nil {
+                                    PopoverCard(title: "") {
+                                        VStack(alignment: .leading, spacing: 14) {
+                                            periodControl
+                                            hero
+                                            if !isSectionHidden("sources") { sourceBar }
+                                        }
                                     }
                                 }
                                 if !isSectionHidden("quota") { quotaSection }
                                 if !isSectionHidden("balance") { balanceSection }
-                                if !isSectionHidden("activity") {
+                                if !isSectionHidden("activity"), app.databaseProblem == nil {
                                     PopoverCard(title: "Activity",
                                                 accessory: { historyAccessory },
                                                 trailing: { historyPicker }) { historyBlock }
@@ -314,10 +319,12 @@ struct PopoverHomeView: View {
                     .accessibilityValue(Text("\(Format.full(tokens)) tokens"))
                 Text("tokens")
                     .font(TMType.regular(13))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(TMDesign.quiet)
             }
             HStack(spacing: 16) {
-                HeroChip(label: "Spent", value: combinedSpentText,
+                // OpenRouter only reports a monthly window, as the Overview says too.
+                HeroChip(label: period == .all && AccountConnection.openRouter ? "Spent · OR recent month" : "Spent",
+                         value: combinedSpentText,
                          problem: deepseekSpendPending
                              ? RowProblem(title: "DeepSeek spending not included yet",
                                           detail: "Spent leaves out DeepSeek's account billing for this "
@@ -394,15 +401,8 @@ struct PopoverHomeView: View {
     }
 
     private var subsAmortized: Double {
-        let days: Int
-        switch period {
-        case .today: days = 1
-        case .week: days = 7
-        case .month: days = 30
-        // All: a 10-year window covers every subscription, ended ones included.
-        case .all: days = 3650
-        }
-        return SubscriptionMath.amortized(days: days, subscriptions: app.subscriptions)
+        SubscriptionMath.amortized(slot: period.slot, configuration: periodSettings.configuration,
+                                   subscriptions: app.subscriptions, now: now)
     }
 
     /// Source share bar plus one row per source.
@@ -439,24 +439,25 @@ struct PopoverHomeView: View {
             } else {
                 SourceBar(segments: rows.map { row in
                     (Double(ToolKind(rawValue: row.tool)?.totalTokens(row) ?? (row.input + row.output)),
-                     Self.sourceColor(row.tool))
+                     TMDesign.sourceColor(row.tool))
                 })
 
                 ForEach(rows, id: \.tool) { row in
                     HStack(spacing: 7) {
                         Circle()
-                            .fill(Self.sourceColor(row.tool))
+                            .fill(TMDesign.sourceColor(row.tool))
                             .frame(width: 7, height: 7)
                         Text(ToolKind(rawValue: row.tool)?.displayName ?? row.tool)
                             .font(TMType.medium(TMType.body))
                             .foregroundStyle(.primary)
                         Text("(\(percentText(row, total: total)))")
                             .font(TMType.number(TMType.caption))
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(TMDesign.quiet)
                         Spacer()
-                        Text(Format.compact(ToolKind(rawValue: row.tool)?.totalTokens(row) ?? (row.input + row.output)))
+                        let value = ToolKind(rawValue: row.tool)?.totalTokens(row) ?? (row.input + row.output)
+                        Text(Format.compact(value))
                             .font(TMType.number(TMType.body))
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(TMDesign.quiet)
                     }
                     .accessibilityElement(children: .combine)
                     .accessibilityLabel(ToolKind(rawValue: row.tool)?.displayName ?? row.tool)
@@ -464,13 +465,6 @@ struct PopoverHomeView: View {
                 }
             }
         }
-    }
-
-    /// The estimated row reuses Claude's hue, faded, so it reads as "more
-    /// Claude, but not measured".
-    private static func sourceColor(_ tool: String) -> Color {
-        if tool == ClaudeNonLocalEstimator.estimateToolLabel { return ToolKind.claude.color.opacity(0.45) }
-        return ToolKind(rawValue: tool)?.color ?? TMDesign.accent
     }
 
     private func loadDetectedTools() {
@@ -627,7 +621,7 @@ struct PopoverHomeView: View {
     private var historyAccessory: some View {
         Text(historyMode == .heatmap
              ? "\(activeDays) active days"
-             : "Peak \(Format.compact(trendPeak))")
+             : trendPeak > 0 ? "Peak \(Format.compact(trendPeak))" : "")
             .font(TMType.number(TMType.caption))
             .foregroundStyle(TMDesign.quiet)
     }
@@ -1107,7 +1101,7 @@ struct PopoverHomeView: View {
         return state.balanceError.map { RowProblem.from(service: "DeepSeek", error: $0) }
     }
 
-    /// "~3.2d left" when the DeepSeek balance is running out. Platform
+    /// "3.2d left" when the DeepSeek balance is running out. Platform
     /// logins report this month's spend directly; API-key logins fall back
     /// to how the recorded balance has been falling. Several funded wallets
     /// have no single answer, so they say nothing.
@@ -1186,33 +1180,32 @@ private struct TrendChartView: View {
                 if let h = hoveredTrend {
                     Text("\(shortDayFormatter.string(from: dayFromKey(h.key))) · \(Format.compact(h.tokens))")
                         .font(TMType.number(TMType.caption))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(TMDesign.quiet)
                 }
                 Spacer()
             }
             .frame(height: 16)
-            // Smoothed line (catmullRom). The persisted heatmap cache covers the
-            // cold start; fresh data replaces it asynchronously.
+            // Monotone, as on the Performance page: a curve that overshoots
+            // would show usage that never happened. The persisted heatmap cache
+            // covers the cold start; fresh data replaces it asynchronously.
             Chart(series, id: \.key) { d in
                 AreaMark(
                     x: .value("Day", dayFromKey(d.key)),
                     y: .value("Tokens", d.tokens)
                 )
-                .foregroundStyle(LinearGradient(
-                    colors: [TMDesign.accent.opacity(0.28), TMDesign.accent.opacity(0.02)],
-                    startPoint: .top, endPoint: .bottom))
-                .interpolationMethod(.catmullRom)
+                .foregroundStyle(TMDesign.accent.opacity(0.16))
+                .interpolationMethod(.monotone)
                 LineMark(
                     x: .value("Day", dayFromKey(d.key)),
                     y: .value("Tokens", d.tokens)
                 )
                 .foregroundStyle(TMDesign.accent)
                 .lineStyle(StrokeStyle(lineWidth: 1.6, lineCap: .round, lineJoin: .round))
-                .interpolationMethod(.catmullRom)
+                .interpolationMethod(.monotone)
             }
             .chartXAxis {
                 // Three date labels, colored like the Activity month labels.
-                AxisMarks(values: .automatic(desiredCount: 3)) { _ in
+                AxisMarks(preset: .aligned, values: .automatic(desiredCount: 3)) { _ in
                     AxisGridLine().foregroundStyle(Color.primary.opacity(0.08))
                     AxisValueLabel(format: .dateTime.month(.defaultDigits).day())
                         .font(.system(size: 10))
@@ -1514,7 +1507,7 @@ private struct BalanceLine: View {
                     Spacer()
                     Text(item.value)
                         .font(TMType.number(TMType.body))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(TMDesign.quiet)
                 }
                 .lineLimit(1)
                 .accessibilityElement(children: .combine)
@@ -1602,7 +1595,6 @@ private struct PopoverCard<Accessory: View, Trailing: View, Content: View>: View
                     // Title case, matching the dashboard cards.
                     Text(title)
                         .font(TMType.semibold(12))
-                        .foregroundStyle(TMDesign.quiet)
                     accessory
                     Spacer(minLength: 6)
                     trailing
@@ -1632,6 +1624,17 @@ struct QuotaWindow {
     let resetIn: String?
     /// 0…1, how much of the window's time has passed; nil if unknown.
     var elapsed: Double?
+
+    /// What a number or bar shows, 0…100, in the selected used or remaining mode.
+    static func shownPercent(used: Double, showsRemaining: Bool) -> Double {
+        showsRemaining ? 100 - used : used
+    }
+
+    /// The time the bar compares against. Pace is a reading of usage, so the
+    /// remaining mode is a plain gauge without it.
+    func barElapsed(showsRemaining: Bool) -> Double? {
+        showsRemaining ? nil : elapsed
+    }
 }
 
 /// ```
@@ -1646,8 +1649,8 @@ private struct QuotaWindowLine: View {
     let tint: Color
     @AppStorage(QuotaWindow.showsRemainingKey) private var showsRemaining = false
 
-    private var shownPercent: Int {
-        Int((showsRemaining ? 100 - window.usedPercent : window.usedPercent).rounded())
+    private var shownPercent: Double {
+        QuotaWindow.shownPercent(used: window.usedPercent, showsRemaining: showsRemaining)
     }
 
     var body: some View {
@@ -1665,13 +1668,13 @@ private struct QuotaWindowLine: View {
                         .foregroundStyle(TMDesign.quiet)
                 }
                 Spacer(minLength: 8)
-                Text("\(shownPercent)%")
+                Text("\(Int(shownPercent.rounded()))%")
                     .font(TMType.number(TMType.caption, weight: .medium))
                     .foregroundStyle(.primary)
             }
-            UsageBar(usedPercent: showsRemaining ? 100 - window.usedPercent : window.usedPercent,
+            QuotaBar(fillPercent: shownPercent,
                      tint: tint,
-                     elapsed: window.elapsed.map { showsRemaining ? 1 - $0 : $0 })
+                     elapsed: window.barElapsed(showsRemaining: showsRemaining))
         }
     }
 }
@@ -1679,28 +1682,30 @@ private struct QuotaWindowLine: View {
 /// Quota bar: fills rightward to the selected used or remaining percentage.
 /// Filled with the service's color at every usage level.
 ///
-/// With a time mark, solid color runs to whichever comes first, quota or
-/// time; the stretch between the two is one step lighter. Below the time
-/// mark it is a darker track; above it is a paler fill. Either way the solid
-/// edge is the time mark, so it never disappears under the fill.
-private struct UsageBar: View {
+/// With a time mark, solid color runs to whichever comes first, usage or
+/// elapsed time; the stretch between the two is one step lighter. Behind
+/// time it is a darker track (headroom); past time it is a paler fill
+/// (using the window faster than it passes). Either way the solid edge is
+/// the time mark, so it never disappears under the fill.
+private struct QuotaBar: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    let usedPercent: Double
+    /// 0…100, in the selected used or remaining mode.
+    let fillPercent: Double
     let tint: Color
-    /// 0…1 share of the window's time, matching the quota's used/remaining mode.
+    /// 0…1 share of the window's time already passed; nil draws a plain gauge.
     var elapsed: Double?
 
     var body: some View {
-        let used = min(max(usedPercent / 100, 0), 1)
+        let fill = min(max(fillPercent / 100, 0), 1)
         GeometryReader { geo in
-            let usedWidth = used > 0 ? max(geo.size.width * used, 4) : 0
+            let fillWidth = fill > 0 ? max(geo.size.width * fill, 4) : 0
             let timeWidth = elapsed.map { $0 > 0 ? max(geo.size.width * min($0, 1), 4) : 0 }
             ZStack(alignment: .leading) {
                 Capsule().fill(Color.primary.opacity(0.06))
-                if let timeWidth, usedWidth > timeWidth {
+                if let timeWidth, fillWidth > timeWidth {
                     Capsule()
                         .fill(tint.opacity(0.45))
-                        .frame(width: usedWidth)
+                        .frame(width: fillWidth)
                     Capsule()
                         .fill(tint)
                         .frame(width: timeWidth)
@@ -1712,10 +1717,10 @@ private struct UsageBar: View {
                     }
                     Capsule()
                         .fill(tint)
-                        .frame(width: usedWidth)
+                        .frame(width: fillWidth)
                 }
             }
-            .animation(reduceMotion ? nil : .easeOut(duration: 0.35), value: used)
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.35), value: fill)
         }
         .frame(height: 4)
         .accessibilityHidden(true)
@@ -1724,7 +1729,7 @@ private struct UsageBar: View {
 
 /// Composition bar for Sources: the parts always fill the whole width, each
 /// its own rounded segment with a gap between, like the storage bar in
-/// System Settings. Deliberately unlike `UsageBar`, which is a gauge on an
+/// System Settings. Deliberately unlike `QuotaBar`, which is a gauge on an
 /// empty track.
 struct SourceBar: View {
     static let gap: CGFloat = 2
@@ -1807,7 +1812,7 @@ private struct UnconnectedSourcesRow: View {
                     .foregroundStyle(TMDesign.quiet)
                 Text(names.joined(separator: " · "))
                     .font(TMType.regular(TMType.micro))
-                    .foregroundStyle(TMDesign.faint)
+                    .foregroundStyle(TMDesign.quiet)
                     .lineLimit(2)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -1846,7 +1851,7 @@ struct PopoverHeatmap: View {
     static var totalHeight: CGFloat { gridHeight }
 
     /// Opacity of the accent for levels 1…4 — one hue, light to strong.
-    private static let levelOpacity: [Double] = [0.28, 0.5, 0.75, 1]
+    static let levelOpacity: [Double] = [0.28, 0.5, 0.75, 1]
 
     /// Quartile cut points of the active days' totals. Levels follow rank,
     /// not share of the peak, so one huge day can't flatten every other day

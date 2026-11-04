@@ -36,6 +36,10 @@ struct OverviewView: View {
 
     var body: some View {
         DashPage {
+            if let problem = app.databaseProblem {
+                DashCard { DatabaseProblemView(problem: problem) }
+                    .dashFixedHeight()
+            }
             HStack(alignment: .center, spacing: 12) {
                 periodControl
                 Spacer(minLength: 8)
@@ -46,10 +50,8 @@ struct OverviewView: View {
                     .tmNumericTextTransition(value: Double(periodTokens))
                     .animation(reduceMotion ? nil : .easeOut(duration: 0.35), value: periodTokens)
                 DashMetric(label: "Calls", value: Format.count(periodCalls))
-                DashMetric(label: actualSpendLabel, value: actualSpendText,
-                           help: actualSpendHelp)
-                DashMetric(label: "API Value", value: Format.money(apiValue),
-                           help: "What these model calls would cost at official API list prices. This is not a billed amount.")
+                DashMetric(label: actualSpendLabel, value: actualSpendText)
+                DashMetric(label: "API Value", value: apiValue > 0 ? Format.money(apiValue) : "—")
             }
             // The breakdowns absorb the window's spare height; a long model
             // list scrolls inside its card.
@@ -63,7 +65,7 @@ struct OverviewView: View {
                     weeks: heatmapWeeks,
                     heatmap: app.heatmap,
                     heatmapCost: app.heatmapCost,
-                    maxTokens: heatmapMaxTokens,
+                    thresholds: PopoverHeatmap.thresholds(heatmapWeeks.joined().compactMap { $0.flatMap { app.heatmap[$0] } }),
                     weekdayLabels: weekdayLabels,
                     hoveredDay: $hoveredDay
                 )
@@ -125,6 +127,15 @@ struct OverviewView: View {
         }
     }
 
+    private var periodRows: [Database.ToolTotals] {
+        switch period {
+        case .today: return app.byToolToday
+        case .week: return app.byToolWeek
+        case .month: return app.byToolMonth
+        case .all: return app.byToolAll
+        }
+    }
+
     private var periodCalls: Int64 {
         switch period {
         case .today: return app.today.count
@@ -156,15 +167,15 @@ struct OverviewView: View {
     /// Actual spend = billed/direct cost + OpenRouter + amortized subscriptions.
     private var actualSpend: Double {
         let orUsage: Double
-        let days: Int
         switch period {
-        case .today: orUsage = orClient.state.usageDaily; days = 1
-        case .week: orUsage = orClient.state.usageWeekly; days = 7
-        case .month: orUsage = orClient.state.usageMonthly; days = 30
-        case .all: orUsage = orClient.state.usageMonthly; days = 3650 // OpenRouter has only a monthly window; 10 years covers every subscription
+        case .today: orUsage = orClient.state.usageDaily
+        case .week: orUsage = orClient.state.usageWeekly
+        case .month: orUsage = orClient.state.usageMonthly
+        case .all: orUsage = orClient.state.usageMonthly // OpenRouter has only a monthly window
         }
         return periodCost.actual + orUsage
-            + SubscriptionMath.amortized(days: days, subscriptions: app.subscriptions)
+            + SubscriptionMath.amortized(slot: period.slot, configuration: periodSettings.configuration,
+                                         subscriptions: app.subscriptions)
     }
 
     /// Same composition as the popover's Spent chip: local billed cost,
@@ -182,14 +193,6 @@ struct OverviewView: View {
         if period == .all { return "Actual Spend · OR recent month" }
         return "Actual Spend"
     }
-
-    private var actualSpendHelp: String {
-        let base = "Billed turn costs, OpenRouter account usage, and subscription amortization."
-        return period == .all
-            ? base + " OpenRouter only exposes its recent monthly window, so All Time includes that recent month rather than full history."
-            : base
-    }
-
 
     private var statusLine: some View {
         let broken = health.sources.filter { $0.error != nil }.count
@@ -210,11 +213,6 @@ struct OverviewView: View {
         return (0..<7).map { row in
             row % 2 == 1 ? "" : symbols[(calendar.firstWeekday - 1 + row) % 7]
         }
-    }
-
-    /// One O(n) pass per body evaluation, shared by every heatmap cell.
-    private var heatmapMaxTokens: Int64 {
-        app.heatmap.values.max() ?? 0
     }
 
     /// 53-week geometry is keyed by calendar year and ordinal day. A day-only
@@ -266,7 +264,9 @@ struct OverviewView: View {
     // MARK: - Attribution
 
     private var toolItems: [ShareItem] {
-        toolRows(period).map { ShareItem(name: $0.0, value: $0.1, color: $0.3) }
+        toolRows(period).map {
+            ShareItem(name: $0.0, value: $0.1, color: $0.3)
+        }
     }
 
     private var modelItems: [ShareItem] {
@@ -307,21 +307,14 @@ struct OverviewView: View {
     }
 
     private func toolRows(_ period: Period) -> [(String, Int64, Double, Color)] {
-        let rows: [Database.ToolTotals]
-        switch period {
-        case .today: rows = app.byToolToday
-        case .week: rows = app.byToolWeek
-        case .month: rows = app.byToolMonth
-        case .all: rows = app.byToolAll
-        }
-        return rows.sorted {
+        periodRows.sorted {
             (ToolKind(rawValue: $0.tool)?.totalTokens($0) ?? $0.input + $0.output) >
                 (ToolKind(rawValue: $1.tool)?.totalTokens($1) ?? $1.input + $1.output)
         }.map { row in
             (ToolKind(rawValue: row.tool)?.displayName ?? row.tool,
              ToolKind(rawValue: row.tool)?.totalTokens(row) ?? row.input + row.output,
              row.cost,
-             ToolKind(rawValue: row.tool)?.color ?? TMDesign.accent)
+             TMDesign.sourceColor(row.tool))
         }
     }
 }
@@ -340,7 +333,8 @@ private struct HeatmapGrid: View {
     let weeks: [[Int64?]]
     let heatmap: [Int64: Int64]
     let heatmapCost: [Int64: Double]
-    let maxTokens: Int64
+    /// Same quartile levels as the panel: one huge day cannot flatten the rest.
+    let thresholds: [Int64]
     /// One label per weekday row, empty for rows that stay unlabeled.
     let weekdayLabels: [String]
     @Binding var hoveredDay: HeatmapDay?
@@ -455,7 +449,7 @@ private struct HeatmapGrid: View {
                 RoundedRectangle(cornerRadius: 2.5, style: .continuous)
                     .fill(level == 0
                           ? Color.primary.opacity(0.07)
-                          : TMDesign.accent.opacity(0.18 + Double(level) / 4 * 0.72))
+                          : TMDesign.accent.opacity(PopoverHeatmap.levelOpacity[level - 1]))
                     .frame(width: 12, height: 12)
                     .accessibilityHidden(true)
             }
@@ -495,17 +489,13 @@ private struct HeatmapGrid: View {
         // date > now); it renders fainter than a real zero-token day.
         if let day, day > 0 {
             let tokenCount = heatmap[day] ?? 0
-            let value = Double(tokenCount)
-            let maxValue = Double(maxTokens)
-            let intensity = value > 0 && maxValue > 0 ? max(0.18, min(1, value / maxValue)) : 0
+            let level = PopoverHeatmap.level(tokenCount, thresholds: thresholds)
             let label = Format.shortDayKey(day)
             let cost = heatmapCost[day] ?? 0
             let valueText = "\(Format.full(tokenCount)) tokens" + (cost > 0 ? ", \(Format.money(cost))" : "")
 
             RoundedRectangle(cornerRadius: 3, style: .continuous)
-                // Linear ramp with a 0.4 floor so any populated day (today
-                // included) is clearly visible next to the peak day.
-                .fill(value > 0 ? TMDesign.accent.opacity(max(0.4, 0.18 + intensity * 0.72)) : Color.primary.opacity(0.07))
+                .fill(level > 0 ? TMDesign.accent.opacity(PopoverHeatmap.levelOpacity[level - 1]) : Color.primary.opacity(0.07))
                 .frame(width: size, height: size)
                 .contentShape(Rectangle())
                 .accessibilityLabel(Text(label))

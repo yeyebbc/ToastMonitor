@@ -16,10 +16,10 @@ struct PlansView: View {
     @AppStorage(QuotaWindow.showsRemainingKey) private var showsRemaining = false
 
     /// Tall enough for the largest figure column (label, figure, bar and two
-    /// caption lines) under a header. Every account plus Subscriptions and
-    /// Not connected is at most nine cards: three rows of three fit the
-    /// dashboard's minimum window without scrolling.
-    static let cardHeight: CGFloat = 148
+    /// caption lines) under a header and a two-line error. Every account plus
+    /// Subscriptions and Not connected is at most nine cards: three rows of
+    /// three fit the dashboard's minimum window without scrolling.
+    static let cardHeight: CGFloat = 176
     static let columns = 3
     static let cardInset: CGFloat = 14
 
@@ -47,7 +47,7 @@ struct PlansView: View {
         if goConnected { out.append(AnyView(goCard)) }
         if orConnected { out.append(AnyView(orCard)) }
         if deepseekConnected { out.append(AnyView(deepseekCard)) }
-        if !app.subscriptions.isEmpty { out.append(AnyView(subsCard)) }
+        if !activeSubscriptions.isEmpty { out.append(AnyView(subsCard)) }
         if !unconnected.isEmpty { out.append(AnyView(unconnectedCard)) }
         return out
     }
@@ -182,7 +182,7 @@ struct PlansView: View {
                 FigureColumn(label: "Today", value: Format.money(or.usageDaily))
                 FigureColumn(label: "This month", value: Format.money(or.usageMonthly))
                 if let remaining = or.limitRemaining, let limit = or.limit, limit > 0 {
-                    // Bar semantics are "used": a fresh key renders empty.
+                    // Pass what is used; quotaColumn applies the used/remaining mode.
                     quotaColumn("Key", usedPercent: (limit - remaining) / limit * 100,
                                 captions: ["\(Format.money(remaining)) of \(Format.money(limit)) left"],
                                 color: ToolKind.openrouter.color)
@@ -221,8 +221,16 @@ struct PlansView: View {
         }
     }
 
+    /// Ended plans stay in Settings and in All Time spend, not on this page.
+    private var activeSubscriptions: [Database.Subscription] {
+        let now = Date()
+        return app.subscriptions.filter {
+            SubscriptionMath.cycleInfo(start: $0.startDate, end: $0.endDate, cycle: $0.cycle, now: now) != nil
+        }
+    }
+
     private var subsCard: some View {
-        let subs = app.subscriptions
+        let subs = activeSubscriptions
         return plainCard(title: "Subscriptions", symbol: "calendar", color: TMDesign.accent) {
             VStack(alignment: .leading, spacing: 8) {
                 ForEach(subs.prefix(3)) { sub in
@@ -230,15 +238,23 @@ struct PlansView: View {
                         Text(sub.name)
                             .font(TMType.medium(TMType.body))
                             .lineLimit(1)
+                            .layoutPriority(1)
                         Spacer(minLength: 8)
                         if let info = SubscriptionMath.cycleInfo(start: sub.startDate, end: sub.endDate, cycle: sub.cycle) {
-                            Text("renews \(Self.shortDate(info.end))")
-                                .font(TMType.regular(TMType.caption))
-                                .foregroundStyle(TMDesign.quiet)
+                            // A long plan name keeps its room; the date gives way whole.
+                            ViewThatFits(in: .horizontal) {
+                                Text("renews \(Self.shortDate(info.end))")
+                                Text(Self.shortDate(info.end))
+                                Color.clear.frame(width: 0, height: 0)
+                            }
+                            .font(TMType.regular(TMType.caption))
+                            .foregroundStyle(TMDesign.quiet)
+                            .lineLimit(1)
                         }
-                        Text("\(Format.money(sub.price))/\(sub.cycle == "yearly" ? "yr" : "mo")")
+                        Text("\(Format.money(sub.price))/\(Self.cycleSuffix(sub.cycle))")
                             .font(TMType.semibold(TMType.body))
                             .tmMonospacedDigit()
+                            .fixedSize()
                     }
                 }
                 if subs.count > 3 {
@@ -278,8 +294,13 @@ struct PlansView: View {
         return DashCard(inset: Self.cardInset) {
             VStack(alignment: .leading, spacing: 0) {
                 header(title: title, symbol: symbol, color: color) {
-                    if !failedEmpty {
-                        freshness(isLoading: isLoading, error: error, lastSync: lastSync)
+                    if error == nil {
+                        freshness(isLoading: isLoading, lastSync: lastSync)
+                    } else if !failedEmpty {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(TMType.regular(TMType.caption))
+                            .foregroundStyle(TMDesign.danger)
+                            .accessibilityHidden(true)
                     }
                     if let refresh {
                         Button(action: refresh) {
@@ -294,6 +315,15 @@ struct PlansView: View {
                         .help("Refresh \(title)")
                         .accessibilityLabel("Refresh \(title)")
                     }
+                }
+                if !failedEmpty, let error {
+                    // Older figures are still below; the whole reason stays readable.
+                    Text(error)
+                        .font(TMType.regular(TMType.caption))
+                        .foregroundStyle(TMDesign.danger)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.top, 4)
                 }
                 Group {
                 if failedEmpty, let error {
@@ -349,40 +379,31 @@ struct PlansView: View {
     /// Trailing status: how long ago the account updated; a colored mark
     /// only for states that need attention.
     @ViewBuilder
-    private func freshness(isLoading: Bool, error: String?, lastSync: Int64) -> some View {
+    private func freshness(isLoading: Bool, lastSync: Int64) -> some View {
         let age = Int64(Date().timeIntervalSince1970) - lastSync
-        if let error {
-            Label(error, systemImage: "exclamationmark.triangle.fill")
-                .font(TMType.regular(TMType.caption))
-                .foregroundStyle(TMDesign.danger)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .help(error)
-        } else if isLoading {
+        if isLoading {
             EmptyView()
         } else if lastSync <= 0 {
             TMStatusPill(text: "Idle", color: TMDesign.quiet, symbol: "circle.dashed")
         } else if age > 120 {
-            TMStatusPill(text: "Stale", color: TMDesign.accent, symbol: "clock.badge.exclamationmark")
-                .help("Updated \(Format.dateTime(lastSync))")
+            TMStatusPill(text: "\(Format.remaining(age)) ago", color: TMDesign.accent, symbol: "clock.badge.exclamationmark")
         } else {
             Text(age < 60 ? "Just now" : "\(Format.remaining(age)) ago")
                 .font(TMType.regular(TMType.caption))
                 .tmMonospacedDigit()
                 .foregroundStyle(TMDesign.quiet)
-                .help("Updated \(Format.dateTime(lastSync))")
         }
     }
 
-    /// A quota window as a figure column. The bar always encodes usage; the
-    /// used/remaining preference from the popover changes only the figure.
+    /// A quota window as a figure column. The figure and the bar both follow
+    /// the used/remaining preference from the popover.
     private func quotaColumn(_ label: String, usedPercent: Double, captions: [String],
                              color: Color) -> FigureColumn {
         let p = min(max(usedPercent, 0), 100)
-        let shown = Int((showsRemaining ? 100 - p : p).rounded())
-        return FigureColumn(label: label, value: "\(shown)%",
+        let shown = QuotaWindow.shownPercent(used: p, showsRemaining: showsRemaining)
+        return FigureColumn(label: label, value: "\(Int(shown.rounded()))%",
                             unit: showsRemaining ? "left" : "used",
-                            usedPercent: p, barTint: color, captions: captions)
+                            barPercent: shown, barTint: color, captions: captions)
     }
 
     /// "resets in 4.8d" for an absolute unix-seconds reset; nil once passed.
@@ -400,6 +421,14 @@ struct PlansView: View {
     }()
 
     private static func shortDate(_ date: Date) -> String { dateFormatter.string(from: date) }
+
+    private static func cycleSuffix(_ cycle: String) -> String {
+        switch cycle {
+        case "yearly": return "yr"
+        case "weekly": return "wk"
+        default: return "mo"
+        }
+    }
 }
 
 /// One figure in an account card: a small label, the figure, an optional
@@ -409,7 +438,7 @@ private struct FigureColumn: View {
     let value: String
     var unit: String?
     var tint: Color = .primary
-    var usedPercent: Double?
+    var barPercent: Double?
     var barTint: Color = .accentColor
     var captions: [String] = []
     var captionTint: Color = TMDesign.quiet
@@ -433,8 +462,8 @@ private struct FigureColumn: View {
                         .foregroundStyle(TMDesign.quiet)
                 }
             }
-            if let usedPercent {
-                DashUsageBar(usedPercent: usedPercent, tint: barTint, height: 4)
+            if let barPercent {
+                DashUsageBar(fillPercent: barPercent, tint: barTint, height: 4)
                     .padding(.vertical, 2)
             }
             ForEach(captions, id: \.self) { caption in

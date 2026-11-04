@@ -92,7 +92,6 @@ struct DashCard<Trailing: View, Content: View>: View {
 struct DashMetric: View {
     let label: String
     let value: String
-    var help: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -110,7 +109,6 @@ struct DashMetric: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(TMDesign.surface,
                     in: RoundedRectangle(cornerRadius: DashLayout.cardRadius, style: .continuous))
-        .help(help ?? "")
         .accessibilityElement(children: .combine)
         .accessibilityLabel(label)
         .accessibilityValue(Text(value))
@@ -216,11 +214,10 @@ struct ShareList: View {
     }
 }
 
-/// Usage bar: empty = untouched, fills rightward as the window is used. Always
-/// encodes usage; the used/remaining preference changes the label only.
+/// Gauge bar: fills rightward to the percentage it is given.
 struct DashUsageBar: View {
-    /// 0…100 — how much is used.
-    let usedPercent: Double
+    /// 0…100.
+    let fillPercent: Double
     let tint: Color
     var height: CGFloat = 6
     /// Optional hairline at a fixed fraction (0…1) of the bar — e.g. the
@@ -228,7 +225,7 @@ struct DashUsageBar: View {
     var marker: Double?
 
     var body: some View {
-        let used = min(max(usedPercent, 0), 100) / 100
+        let used = min(max(fillPercent, 0), 100) / 100
         GeometryReader { geo in
             ZStack(alignment: .leading) {
                 Capsule().fill(Color.primary.opacity(0.09))
@@ -284,6 +281,10 @@ struct DashSegmented<Value: Hashable & Identifiable>: View {
                          accessibilityName: accessibilityName)
             .fixedSize()
             .modifier(SegmentedControlSize())
+            // Measured on macOS 27: bare, the capsule overhangs its row by 6.5 pt
+            // on each side, past the cards and into the next control. With any
+            // padding it lays out at full width and lines up with the cards.
+            .padding(.horizontal, 0.5)
     }
 }
 
