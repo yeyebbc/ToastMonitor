@@ -1,5 +1,12 @@
 import Foundation
+#if os(macOS)
 import Combine
+#else
+import SwiftCrossUI
+#endif
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 /// Codex subscription quota via the official ChatGPT backend usage endpoint
 /// (same approach as CodexBar / steipete): reads the OAuth token from

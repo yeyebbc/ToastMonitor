@@ -3,10 +3,10 @@ name: CI
 # Quoted so YAML 1.1 parsers do not fold `on` into boolean true.
 "on":
   push:
-    branches: [main]
+    branches: [main, windows]
     tags: ["v*"]
   pull_request:
-    branches: [main]
+    branches: [main, windows]
   workflow_dispatch:
 
 # NOTE: the source uses macOS 27 SDK APIs (NSSegmentedControl.role etc.),

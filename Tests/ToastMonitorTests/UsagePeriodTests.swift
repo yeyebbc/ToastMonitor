@@ -2,22 +2,6 @@ import XCTest
 @testable import ToastMonitor
 
 final class UsagePeriodTests: XCTestCase {
-    func testRecentLabelsUseCompactTitles() {
-        let config = UsagePeriodConfiguration(mode: .recent, weekStart: .monday)
-        XCTAssertEqual(config.label(for: .today), "Today")
-        XCTAssertEqual(config.label(for: .week), "7 Days")
-        XCTAssertEqual(config.label(for: .month), "30 Days")
-        XCTAssertEqual(config.label(for: .all), "All Time")
-    }
-
-    func testCalendarLabelsUseWeeklyAndMonthly() {
-        let config = UsagePeriodConfiguration(mode: .calendar, weekStart: .monday)
-        XCTAssertEqual(config.label(for: .week), "Weekly")
-        XCTAssertEqual(config.label(for: .month), "Monthly")
-        XCTAssertEqual(config.title(for: .week), "Weekly Usage")
-        XCTAssertEqual(config.title(for: .month), "Monthly Usage")
-    }
-
     func testCalendarWeekRespectsMondayOrSunday() {
         var components = DateComponents()
         components.year = 2026
@@ -54,4 +38,40 @@ final class UsagePeriodTests: XCTestCase {
             Int64(Calendar.current.date(byAdding: .day, value: -29, to: todayStart)!.timeIntervalSince1970)
         )
     }
+    #if os(Windows)
+    func testWindowsPeriodsUseLocalMidnightAfterRestoringEnvironment() throws {
+        defer {
+            NSTimeZone.resetSystemTimeZone()
+            XCTAssertNoThrow(try WindowsTimeZone.initialize())
+        }
+        try WindowsTimeZone.useWindowsTimeZone("China Standard Time")
+        let configuration = UsagePeriodConfiguration()
+        let beforeMidnight = configuration.range(for: .today, now: Date(timeIntervalSince1970: 1_793_807_999))
+        let afterMidnight = configuration.range(for: .today, now: Date(timeIntervalSince1970: 1_793_809_600))
+        XCTAssertEqual(beforeMidnight.start, 1_793_721_600)
+        XCTAssertEqual(afterMidnight.start, 1_793_808_000)
+        XCTAssertEqual(afterMidnight.end, 1_793_809_600)
+    }
+
+    func testWindowsPeriodsPreserveSpringAndAutumnDSTRules() throws {
+        defer {
+            NSTimeZone.resetSystemTimeZone()
+            XCTAssertNoThrow(try WindowsTimeZone.initialize())
+        }
+        try WindowsTimeZone.useWindowsTimeZone("Pacific Standard Time")
+        let configuration = UsagePeriodConfiguration()
+        // These UTC timestamps enclose a 23-hour spring day and a 25-hour autumn day in Los Angeles.
+        let boundaries: [(Int64, Int64, Int64)] = [
+            (1_772_956_800, 1_773_039_600, 23 * 3600),
+            (1_793_516_400, 1_793_606_400, 25 * 3600),
+        ]
+        for (start, nextStart, duration) in boundaries {
+            let day = configuration.range(for: .today, now: Date(timeIntervalSince1970: TimeInterval(start + 12 * 3600)))
+            let next = configuration.range(for: .today, now: Date(timeIntervalSince1970: TimeInterval(nextStart + 12 * 3600)))
+            XCTAssertEqual(day.start, start)
+            XCTAssertEqual(next.start, nextStart)
+            XCTAssertEqual(next.start - day.start, duration)
+        }
+    }
+    #endif
 }

@@ -1,5 +1,8 @@
 import XCTest
 import SQLite3
+#if os(Windows)
+import ucrt
+#endif
 @testable import ToastMonitor
 
 final class HermesSourceSwitchTests: XCTestCase {
@@ -12,11 +15,23 @@ final class HermesSourceSwitchTests: XCTestCase {
         try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
         database = Database.testInstance(path: directory + "/monitor.db")
         previousHome = ProcessInfo.processInfo.environment["HERMES_HOME"]
+        #if os(Windows)
+        _ = _putenv_s("HERMES_HOME", directory)
+        #else
         setenv("HERMES_HOME", directory, 1)
+        #endif
     }
 
     override func tearDown() {
+        #if os(Windows)
+        if let previousHome {
+            _ = _putenv_s("HERMES_HOME", previousHome)
+        } else {
+            _ = _putenv_s("HERMES_HOME", "")
+        }
+        #else
         if let previousHome { setenv("HERMES_HOME", previousHome, 1) } else { unsetenv("HERMES_HOME") }
+        #endif
         database.close()
         try? FileManager.default.removeItem(atPath: directory)
         super.tearDown()

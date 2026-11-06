@@ -1,0 +1,19 @@
+swift-winui 0.2.2 (c4f1cb75c02f4a4fdefcef2e5c5c4388c7cf9389)
+Keep the WinUI UI thread in STA, as required by Windows App SDK:
+https://learn.microsoft.com/windows/apps/windows-app-sdk/migrate-to-windows-app-sdk/guides/threading
+An MTA bootstrap allows UIAutomation peer creation on its IO worker thread;
+our saved native crash stack enters DXamlCore::GetPeerPrivate from that thread.
+This corrects the apartment contract, not accessibility feature availability.
+Retest real UIAutomation after changes; compilation alone does not prove the crash fixed.
+
+--- a/Sources/WinUI/Application/SwiftApplication.swift
++++ b/Sources/WinUI/Application/SwiftApplication.swift
+@@ -43,7 +43,7 @@
+ 
+     public static func main() {
+         do {
+-            try withExtendedLifetime(WindowsAppRuntimeInitializer(threadingModel: .multi)) {
++            try withExtendedLifetime(WindowsAppRuntimeInitializer(threadingModel: .single)) {
+                 // What is going on here??!? Is this necessary??
+                 let appClass = String(describing: String(reflecting: Self.self))
+                 guard let instance = NSClassFromString(appClass) else {

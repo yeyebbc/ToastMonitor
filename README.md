@@ -4,7 +4,7 @@
 [![Swift](https://img.shields.io/badge/Swift-5.10-orange)](Package.swift)
 [![License: MIT](https://img.shields.io/github/license/Toast1zz/ToastMonitor)](LICENSE)
 
-A native macOS menu-bar monitor for AI coding usage. It reads the local logs of **Claude Code, Codex, OpenCode, Hermes, Oh My Pi and DeepSeek Harness**, checks your subscription quotas and prepaid balances, and keeps today's token total in the menu bar. SwiftUI and the system SQLite, no third-party dependencies.
+A native macOS menu-bar monitor for AI coding usage. It reads local tool logs, checks subscription quotas and prepaid balances, and keeps today's token total in the menu bar. The macOS app uses SwiftUI and system SQLite with no third-party dependencies. An additive Windows port uses separately pinned SwiftCrossUI/WinUI and SQLite runtime dependencies; see [Windows build, behavior and limits](docs/windows-port.md).
 
 <p align="center">
   <img src="docs/images/popover.png" width="800" alt="ToastMonitor menu-bar panel in light and dark appearance: usage card with period switch, quota bars, balances and activity heatmap">

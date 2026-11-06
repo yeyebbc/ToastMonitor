@@ -1,3 +1,4 @@
+#if os(macOS)
 import Foundation
 import Security
 
@@ -245,3 +246,4 @@ enum KeychainStore {
         return .value(value)
     }
 }
+#endif

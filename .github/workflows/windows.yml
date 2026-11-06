@@ -1,0 +1,89 @@
+name: Windows
+
+"on":
+  push:
+    branches: [main, windows]
+  pull_request:
+    branches: [main, windows]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      SWIFT_DETERMINISTIC_HASHING: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Swift 6.1.3 x64
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP 'swift-6.1.3.exe'
+          Invoke-WebRequest 'https://download.swift.org/swift-6.1.3-release/windows10/swift-6.1.3-RELEASE/swift-6.1.3-RELEASE-windows10.exe' -OutFile $installer
+          if ((Get-FileHash $installer -Algorithm SHA256).Hash -ne 'E298FB5EED208E94E02C365772B31976462439446A9C9CD6499309B8BA50D999') {
+            throw 'Swift installer checksum mismatch.'
+          }
+          $install = Start-Process $installer -Wait -PassThru -ArgumentList '/quiet /norestart InstallRoot="C:\Swift" OptionsInstallDBG=0 OptionsInstallIDE=0 OptionsInstallPy=0 OptionsInstallWindowsSDKX86=0 OptionsInstallWindowsSDKARM64=0 OptionsInstallWindowsRedistX86=0 OptionsInstallWindowsRedistARM64=0'
+          if ($install.ExitCode -notin @(0, 3010)) { throw "Swift install failed: $($install.ExitCode)" }
+
+      - name: Cache Windows dependencies and build
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/toastmonitor-build
+          key: windows-swift-6.1.3-${{ hashFiles('Package.swift', 'Package.resolved') }}-${{ hashFiles('Sources/**/*.swift', 'Windows/**', 'Tests/**/*.swift') }}
+          restore-keys: |
+            windows-swift-6.1.3-${{ hashFiles('Package.swift', 'Package.resolved') }}-
+
+      - name: Build native Windows application
+        run: ./Windows/Scripts/build.ps1 -Action build -SwiftPath 'C:/Swift/Toolchains/6.1.3+Asserts/usr/bin/swift.exe' -BuildPath '${{ runner.temp }}/toastmonitor-build'
+
+      - name: Run shared accounting and database contracts
+        run: ./Windows/Scripts/build.ps1 -Action test -SwiftPath 'C:/Swift/Toolchains/6.1.3+Asserts/usr/bin/swift.exe' -BuildPath '${{ runner.temp }}/toastmonitor-build'
+
+      - name: Assemble dynamically linked release package
+        run: ./Windows/Scripts/build.ps1 -Action package -Configuration release -SwiftPath 'C:/Swift/Toolchains/6.1.3+Asserts/usr/bin/swift.exe' -BuildPath '${{ runner.temp }}/toastmonitor-build'
+
+      - name: Exercise extracted package with installed runtime prerequisites
+        run: |
+          $package = Join-Path $env:RUNNER_TEMP 'toastmonitor-package-smoke'
+          Expand-Archive -LiteralPath 'dist/ToastMonitor-Windows-x64.zip' -DestinationPath $package
+          $exe = Join-Path $package 'ToastMonitor.exe'
+          $swiftRuntime = 'C:/Swift/Runtimes/6.1.3/usr/bin'
+          $sqliteRuntime = Join-Path '${{ runner.temp }}/toastmonitor-build' 'dependencies/sqlite/bin'
+          $runtimeDllNames = @((Get-ChildItem $swiftRuntime -File -Filter '*.dll').Name) + 'sqlite3.dll'
+          $runtimePayloads = Get-ChildItem $package -Recurse -File | Where-Object {
+            $_.Extension -in @('.msi', '.msix', '.msixbundle', '.appx', '.appxbundle') -or
+            ($_.Extension -eq '.exe' -and $_.FullName -ne $exe) -or
+            ($_.Extension -eq '.dll' -and ($_.Name -in $runtimeDllNames -or
+              $_.Name -match '^(msvcp|vcruntime|concrt|ucrtbase|api-ms-|ext-ms-)'))
+          }
+          if ($runtimePayloads) { throw 'The package must not bundle the preinstalled system runtimes or installers.' }
+          if (!(Test-Path (Join-Path $package 'ToastMonitorRuntime.dll'))) { throw 'The application DLL is missing.' }
+          $bootstrap = Get-ChildItem $package -Recurse -File -Filter 'Microsoft.WindowsAppRuntime.Bootstrap.dll'
+          if (!$bootstrap) { throw 'The application-local WinAppSDK bootstrap resource is missing.' }
+          $oldPath = $env:Path
+          $oldDatabasePath = $env:TM_DATABASE_PATH
+          try {
+            $env:Path = "$swiftRuntime;$sqliteRuntime;$env:SystemRoot\System32;$env:SystemRoot"
+            $env:TM_DATABASE_PATH = Join-Path $env:RUNNER_TEMP 'toastmonitor-package-smoke.db'
+            $usage = & $exe --print-usage
+            if ($LASTEXITCODE -ne 0) { throw 'Packaged executable could not open an isolated database.' }
+            $totals = ($usage -join "`n") | ConvertFrom-Json
+            if ($totals.period -ne 'today' -or !(Test-Path $env:TM_DATABASE_PATH)) { throw 'Packaged usage command did not return its database result.' }
+          } finally {
+            $env:Path = $oldPath
+            if ($null -eq $oldDatabasePath) { Remove-Item Env:TM_DATABASE_PATH -ErrorAction SilentlyContinue }
+            else { $env:TM_DATABASE_PATH = $oldDatabasePath }
+          }
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v7
+        with:
+          name: ToastMonitor-Windows-x64
+          path: dist/ToastMonitor-Windows-x64.zip
+          if-no-files-found: error
+          retention-days: 14

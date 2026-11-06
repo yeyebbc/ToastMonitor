@@ -1,6 +1,10 @@
+#if os(macOS)
 import Combine
-import Foundation
 import UserNotifications
+#else
+import SwiftCrossUI
+#endif
+import Foundation
 
 enum QuotaAlertPolicy {
     struct BadgeState: Codable, Equatable {
@@ -68,12 +72,18 @@ final class QuotaAlertManager: ObservableObject {
     private let readingProvider: (() -> [Reading])?
     private var badgeStates: [String: QuotaAlertPolicy.BadgeState] = [:]
     private static let badgeStateKey = "quota_alert_badge_states"
+    #if os(macOS)
     private var cancellables: Set<AnyCancellable> = []
     /// Direct SwiftPM/headless render binaries have no application bundle
     /// proxy, and UserNotifications throws an Objective-C exception if its
     /// center is created there. Resolve it only when normal app startup or an
     /// explicit settings action actually needs notification delivery.
     private lazy var center = UNUserNotificationCenter.current()
+    #else
+    private var windowsObservations: [SwiftCrossUI.Cancellable] = []
+    private var windowsPublishers: [SwiftCrossUI.Publisher] = []
+    private var windowsNotificationObservers: [NSObjectProtocol] = []
+    #endif
 
     init(readingProvider: (() -> [Reading])? = nil) {
         self.readingProvider = readingProvider
@@ -89,6 +99,7 @@ final class QuotaAlertManager: ObservableObject {
     func start() {
         guard !started else { return }
         started = true
+        #if os(macOS)
         NotificationCenter.default.publisher(for: PanelController.visibilityNotification)
             .sink { [weak self] notification in
                 guard let self, let visible = notification.object as? Bool else { return }
@@ -113,6 +124,33 @@ final class QuotaAlertManager: ObservableObject {
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.scheduleRenewalReminders() }
             .store(in: &cancellables)
+        #else
+        windowsNotificationObservers.append(NotificationCenter.default.addObserver(
+            forName: TMNotifications.popoverVisibility, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self, let visible = note.object as? Bool else { return }
+            MainActor.assumeIsolated {
+                self.panelVisible = visible
+                if visible { self.evaluate() }
+            }
+        })
+        windowsPublishers = [
+            ClaudeQuotaClient.shared.didChange,
+            CodexQuotaClient.shared.didChange,
+            OpenCodeGoClient.shared.didChange,
+            CommandCodeQuotaClient.shared.didChange,
+            GrokQuotaClient.shared.didChange,
+            OpenRouterClient.shared.didChange,
+        ]
+        windowsObservations = windowsPublishers.map { publisher in
+            publisher.observe { [weak self] in self?.scheduleEvaluation() }
+        }
+        windowsNotificationObservers.append(NotificationCenter.default.addObserver(
+            forName: Database.subscriptionsDidChange, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.scheduleRenewalReminders() }
+        })
+        #endif
         evaluate()
         scheduleRenewalReminders()
     }
@@ -129,9 +167,14 @@ final class QuotaAlertManager: ObservableObject {
         if !newValue {
             enabled = false
             _ = Database.shared.setSetting(Self.enabledKey, nil)
+            #if os(macOS)
             center.removePendingNotificationRequests(withIdentifiers: renewalIdentifiers())
+            #else
+            WindowsAlertDelivery.cancel(identifiers: renewalIdentifiers())
+            #endif
             return
         }
+        #if os(macOS)
         center.requestAuthorization(options: [.alert, .sound]) { [weak self] granted, _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -143,6 +186,12 @@ final class QuotaAlertManager: ObservableObject {
                 }
             }
         }
+        #else
+        enabled = true
+        _ = Database.shared.setSetting(Self.enabledKey, "1")
+        evaluate()
+        scheduleRenewalReminders()
+        #endif
     }
 
     func evaluate() {
@@ -233,7 +282,11 @@ final class QuotaAlertManager: ObservableObject {
     private func scheduleRenewalReminders() {
         guard enabled else { return }
         let subscriptions = Database.shared.subscriptions()
+        #if os(macOS)
         center.removePendingNotificationRequests(withIdentifiers: renewalIdentifiers())
+        #else
+        WindowsAlertDelivery.cancel(identifiers: renewalIdentifiers())
+        #endif
         let now = Date()
         for subscription in subscriptions {
             guard let cycle = SubscriptionMath.cycleInfo(start: subscription.startDate,
@@ -242,6 +295,7 @@ final class QuotaAlertManager: ObservableObject {
                                                          now: now) else { continue }
             let fireDate = cycle.end.addingTimeInterval(-86400)
             guard fireDate > now else { continue }
+            #if os(macOS)
             let content = UNMutableNotificationContent()
             content.title = "Subscription renews tomorrow"
             content.body = "\(subscription.name) renews for \(Format.money(subscription.price))"
@@ -251,6 +305,12 @@ final class QuotaAlertManager: ObservableObject {
             let trigger = UNCalendarNotificationTrigger(dateMatching: components, repeats: false)
             center.add(UNNotificationRequest(identifier: "renewal-\(subscription.id)",
                                              content: content, trigger: trigger))
+            #else
+            WindowsAlertDelivery.schedule(identifier: "renewal-\(subscription.id)",
+                                         title: "Subscription renews tomorrow",
+                                         body: "\(subscription.name) renews for \(Format.money(subscription.price))",
+                                         at: fireDate)
+            #endif
         }
     }
 
@@ -259,11 +319,15 @@ final class QuotaAlertManager: ObservableObject {
     }
 
     private func post(identifier: String, title: String, body: String) {
+        #if os(macOS)
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
         content.sound = .default
         center.add(UNNotificationRequest(identifier: identifier,
                                          content: content, trigger: nil))
+        #else
+        WindowsAlertDelivery.post(title: title, body: body)
+        #endif
     }
 }

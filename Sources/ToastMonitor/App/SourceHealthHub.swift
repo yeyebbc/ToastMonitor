@@ -1,5 +1,9 @@
 import Foundation
+#if os(macOS)
 import Combine
+#else
+import SwiftCrossUI
+#endif
 
 /// Per-source collection health, observable by the UI.
 struct SourceHealth: Identifiable, Equatable {

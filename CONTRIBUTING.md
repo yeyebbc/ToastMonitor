@@ -1,6 +1,6 @@
 # Contributing to ToastMonitor
 
-Thanks for considering a contribution. This project is a native macOS menu-bar app with **zero third-party dependencies**, and every change should keep it that way.
+Thanks for considering a contribution. The macOS app has **zero third-party dependencies**; the additive Windows port uses a narrowly pinned SwiftCrossUI/WinUI stack, SQLite 3.54.1, and Windows App SDK 1.5 runtime. Keep the existing macOS app and its CI behavior intact when changing Windows code.
 
 ## Development setup
 
@@ -16,6 +16,10 @@ swift test --filter DSHParserTests   # a single suite
 Builds in this repo are normally run with `swift build --disable-sandbox` on the host; CI uses a plain `swift build`.
 
 Successful pushes and manual CI runs on `main` upload a `ToastMonitor-ci-<commit>-universal.zip` artifact after the checks pass. Download it from the run's Artifacts section and extract it once to get `ToastMonitor.app`. These are ad-hoc-signed development builds (version `1.0`) for Apple Silicon and Intel, retained for 14 days.
+
+## Windows development
+
+Windows builds require 64-bit Windows, Visual Studio 2022 C++ x64 build tools, a Windows SDK, Swift 6.1.3, and the Windows App SDK 1.5 runtime. See [the Windows port guide](docs/windows-port.md) for setup, packaging, platform limits, and upstream synchronization guidance. The Windows workflow builds and tests the shared accounting/database contracts independently; do not treat it as a replacement for macOS CI.
 
 ## Visual regression
 
@@ -33,9 +37,9 @@ This compiles the real JSONL reader with release optimization and scans a synthe
 
 ## Constraints
 
-- **No third-party dependencies.** Everything ships with the system frameworks (AppKit, SwiftUI, sqlite3, Security). If you're adding a library, reconsider — almost everything here is a small amount of system-API code.
+- **No third-party dependencies on macOS.** The Windows port is the exception and uses a narrowly pinned SwiftCrossUI/WinUI stack and SQLite runtime; see [`docs/windows-port.md`](docs/windows-port.md).
 - **Local-only privacy default.** User data stays on the Mac unless the user explicitly enables a remote feed or quota service. The one launch-time request is the update check, which is on by default and can be turned off in Settings → Updates. Never add analytics, telemetry or other implicit network calls.
-- **Credentials never in plaintext.** API keys and cookies belong in the macOS Keychain (see `KeychainStore`). Never log, print or store secrets in SQLite/plists.
+- **Credentials never in plaintext.** API keys and cookies belong in macOS Keychain or Windows Credential Manager, never logs or SQLite.
 - **Background Keychain reads never prompt.** `kSecUseAuthenticationUI` and `LAContext.interactionNotAllowed` are honoured only by the data-protection keychain; login-keychain items ignore both and open a SecurityAgent password sheet on an ACL miss. Route every unattended read through `KeychainStore.withoutUserInteraction`, and keep the interactive path behind an explicit `allowPrompt: true` the user asked for.
 
 ## What to touch

@@ -1,4 +1,7 @@
+import Foundation
+#if os(macOS)
 import SwiftUI
+#endif
 
 /// The AI tools ToastMonitor tracks, plus the cloud quota panel.
 enum ToolKind: String, CaseIterable, Identifiable {
@@ -36,6 +39,7 @@ enum ToolKind: String, CaseIterable, Identifiable {
         }
     }
 
+    #if os(macOS)
     /// The product's own brand color where it has one; tools whose brand is
     /// monochrome (OpenCode, Hermes) or unpublished (Oh My Pi) use a system
     /// color so they stay distinguishable and adapt to appearance.
@@ -50,6 +54,7 @@ enum ToolKind: String, CaseIterable, Identifiable {
         case .omp: return Color(nsColor: .systemTeal)
         }
     }
+    #endif
 
     // MARK: - Source configuration (local Mac vs remote VPS)
 

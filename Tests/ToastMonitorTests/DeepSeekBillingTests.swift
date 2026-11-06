@@ -1,5 +1,10 @@
 import XCTest
+#if os(macOS)
 import SwiftUI
+#endif
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 @testable import ToastMonitor
 
 final class DeepSeekBillingTests: XCTestCase {
@@ -228,6 +233,7 @@ final class DeepSeekBillingTests: XCTestCase {
         }
     }
 
+    #if os(macOS)
     @MainActor func testLoginTokenOnlyReadFromExactHTTPSOrigin() {
         XCTAssertTrue(DeepSeekLoginWebView.isPlatformOrigin(URL(string: "https://platform.deepseek.com/usage")))
         for url in ["http://platform.deepseek.com", "https://platform.deepseek.com.evil.example", "https://evil.example",
@@ -235,6 +241,7 @@ final class DeepSeekBillingTests: XCTestCase {
             XCTAssertFalse(DeepSeekLoginWebView.isPlatformOrigin(URL(string: url)))
         }
     }
+    #endif
 }
 
 private actor DeepSeekMockServer {
@@ -474,6 +481,7 @@ final class DeepSeekBillingClientTests: XCTestCase {
         XCTAssertEqual(client.balanceText, "Not connected")
     }
 
+    #if os(macOS)
     /// Opt-in rendered QA uses only the injected server and never starts
     /// collectors, reads credentials, or changes the installed application.
     func testRenderedBillingViews() async throws {
@@ -523,6 +531,7 @@ final class DeepSeekBillingClientTests: XCTestCase {
         XCTAssertGreaterThan(data.count, 1000)
         try data.write(to: url, options: .atomic)
     }
+    #endif
 }
 
 final class DeepSeekBillingTransportTests: XCTestCase {

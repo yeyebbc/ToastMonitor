@@ -1,5 +1,13 @@
 import Foundation
+#if os(macOS)
 import Combine
+import Security
+#else
+import SwiftCrossUI
+#endif
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 /// Claude subscription quota via the OAuth usage endpoint that Claude Code's
 /// own status line is fed from: reads the OAuth access token Claude Code
@@ -327,7 +335,12 @@ final class ClaudeQuotaClient: ObservableObject {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let path = home.appendingPathComponent(".claude/.credentials.json").path
         let fromFile = (try? Data(contentsOf: URL(fileURLWithPath: path))).flatMap(parseCredentials)
+#if os(macOS)
         let fromKeychain = keychainCredentials().flatMap(parseCredentials)
+#else
+        recordDenial(false)
+        let fromKeychain: Credentials? = nil
+#endif
         switch (fromFile, fromKeychain) {
         case (let f?, let k?):
             // Missing expiresAt can't be compared; prefer whichever has one.
@@ -359,6 +372,7 @@ final class ClaudeQuotaClient: ObservableObject {
         denialLock.lock(); _lastReadWasDenied = denied; denialLock.unlock()
     }
 
+#if os(macOS)
     /// Read the raw Claude Code credential blob from the login Keychain.
     ///
     /// Never interactive. The item belongs to Claude Code; ToastMonitor is in
@@ -483,6 +497,7 @@ final class ClaudeQuotaClient: ObservableObject {
         guard !data.isEmpty, data.count <= maxBytes else { return (nil, false) }
         return (data, false)
     }
+#endif
 
     nonisolated static func parseCredentials(_ data: Data) -> Credentials? {
         guard data.count <= 1_000_000,

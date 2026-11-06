@@ -262,6 +262,7 @@ final class ClaudeCodeParserTests: XCTestCase {
     }
 }
 
+#if os(macOS)
 /// Cowork's "local agent mode" writes real Claude Code transcripts under a
 /// separate tree (Claude Desktop's own data directory), one level below a
 /// leading-dot `.claude` component that the ordinary file lister skips.
@@ -319,3 +320,4 @@ final class ClaudeCodeParserCoworkTests: XCTestCase {
         XCTAssertEqual(sessions.first?.sessionID, "cowork-session-1")
     }
 }
+#endif

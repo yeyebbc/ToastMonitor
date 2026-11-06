@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 /// OpenCode Go subscription quota.
 /// There is no public quota API — the workspace dashboard page

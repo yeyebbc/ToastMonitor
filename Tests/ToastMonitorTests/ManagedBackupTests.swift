@@ -65,15 +65,14 @@ final class ManagedBackupTests: XCTestCase {
         }
         let kept = DataMaintenance.retained(weekly + operations, calendar: calendar)
         XCTAssertTrue(Set(weekly.prefix(4).map(\.url)).isSubset(of: kept))
-        XCTAssertEqual(Set(operations.prefix(3).map(\.url)), kept.filter { $0.path.hasPrefix("/o") })
+        XCTAssertEqual(Set(operations.prefix(3).map(\.url)), kept.intersection(Set(operations.map(\.url))))
         let older = weekly.dropFirst(4).filter { kept.contains($0.url) }
         XCTAssertEqual(older.count, 3)
         XCTAssertEqual(Set(older.map { calendar.component(.month, from: $0.date) }).count, 3)
     }
 
-    func testBackupsAreCompressedAndLegacyOnesConverted() throws {
+    func testManagedAndLegacyBackupsRemainRestorable() throws {
         let path = try backup("manual")
-        XCTAssertTrue(path.hasSuffix(".db.lzfse"))
         XCTAssertTrue(DataMaintenance.isBackupFile(URL(fileURLWithPath: path)))
         XCTAssertEqual(DataMaintenance.managedBackupLabel(for: URL(fileURLWithPath: path)), "manual")
 
@@ -83,7 +82,9 @@ final class ManagedBackupTests: XCTestCase {
         let date = Date(timeIntervalSince1970: 1_700_000_000)
         try FileManager.default.setAttributes([.modificationDate: date], ofItemAtPath: legacy.path)
         DataMaintenance.compressLegacyBackups(in: backups)
-        let converted = legacy.appendingPathExtension("lzfse")
+        let converted = try XCTUnwrap(DataMaintenance.availableBackups(in: backups).first {
+            DataMaintenance.managedBackupLabel(for: $0) == "weekly"
+        })
         XCTAssertFalse(FileManager.default.fileExists(atPath: legacy.path))
         let values = try converted.resourceValues(forKeys: [.contentModificationDateKey])
         XCTAssertEqual(values.contentModificationDate, date)

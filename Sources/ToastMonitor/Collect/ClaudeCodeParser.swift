@@ -24,9 +24,21 @@ enum ClaudeCodeParser {
     /// ordinary project roots, which would silently skip the `.claude`
     /// component here — listCoworkFiles() starts its walk past that, so the
     /// dot-skip never applies to it.
+    static var coworkIsSupported: Bool {
+        #if os(Windows)
+        false
+        #else
+        true
+        #endif
+    }
+
     static var coworkLocalAgentRoot: String {
+        #if os(Windows)
+        return FilePlatform.applicationSupport.appendingPathComponent("Claude/local-agent-mode-sessions").path
+        #else
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/Claude/local-agent-mode-sessions").path
+        #endif
     }
 
     /// Enumerates JSONL transcripts under coworkLocalAgentRoot. Best-effort:
@@ -35,6 +47,9 @@ enum ClaudeCodeParser {
     /// rather than surfaced as an error — this is a bonus source, not a
     /// required one.
     static func listCoworkFiles(root: String = coworkLocalAgentRoot) -> [String] {
+        // Windows Cowork uses a platform-specific sandbox layout that this
+        // parser does not support; never mistake the Mac layout for native logs.
+        guard coworkIsSupported else { return [] }
         let fm = FileManager.default
         guard fm.fileExists(atPath: root) else { return [] }
         var out: [String] = []

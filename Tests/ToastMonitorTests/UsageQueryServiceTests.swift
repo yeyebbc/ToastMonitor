@@ -8,8 +8,8 @@ final class UsageQueryServiceTests: XCTestCase {
     private var databasePath = ""
     private var service: UsageQueryService!
 
-    override func setUp() {
-        super.setUp()
+    override func setUp() async throws {
+        try await super.setUp()
         databasePath = FileManager.default.temporaryDirectory
             .appendingPathComponent("toastmonitor-query-tests-\(UUID().uuidString).sqlite").path
         database = Database.testInstance(path: databasePath)
@@ -17,14 +17,14 @@ final class UsageQueryServiceTests: XCTestCase {
                                     queue: DispatchQueue(label: "toastmonitor.queries.tests"))
     }
 
-    override func tearDown() {
+    override func tearDown() async throws {
         database?.close()
         try? FileManager.default.removeItem(atPath: databasePath)
         try? FileManager.default.removeItem(atPath: databasePath + "-wal")
         try? FileManager.default.removeItem(atPath: databasePath + "-shm")
         service = nil
         database = nil
-        super.tearDown()
+        try await super.tearDown()
     }
 
     func testLightCacheInvalidatesForDataVersionAndPeriodConfiguration() async {

@@ -1,5 +1,8 @@
 import XCTest
 import SQLite3
+#if os(Windows)
+import WinSDK
+#endif
 @testable import ToastMonitor
 
 final class RestoreSafetyTests: XCTestCase {
@@ -41,7 +44,8 @@ final class RestoreSafetyTests: XCTestCase {
 
     func testRejectsMissingColumnsWrongTypesAndFutureSchema() {
         for (index, sql) in [
-            "ALTER TABLE turns DROP COLUMN output_tokens;",
+            // Remove dependent triggers so DROP COLUMN creates the intended invalid schema.
+            "DROP TRIGGER turn_rollup_insert; DROP TRIGGER turn_rollup_delete; DROP TRIGGER turn_rollup_update; ALTER TABLE turns DROP COLUMN output_tokens;",
             "ALTER TABLE settings RENAME TO old_settings; CREATE TABLE settings(k INTEGER PRIMARY KEY, v BLOB);",
             "PRAGMA user_version=999;"
         ].enumerated() {
@@ -151,14 +155,30 @@ final class RestoreSafetyTests: XCTestCase {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("tm-ro-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let path = directory.appendingPathComponent("ro.db").path
-        defer {
-            try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: path)
-            try? FileManager.default.removeItem(at: directory)
-        }
         let writable = Database.testInstance(path: path)
         writable.close()
+        #if os(Windows)
+        let attributes = path.withCString(encodedAs: UTF16.self) { GetFileAttributesW($0) }
+        guard attributes != DWORD(INVALID_FILE_ATTRIBUTES) else {
+            return XCTFail("The temporary database's file attributes could not be read.")
+        }
+        #endif
+        defer {
+            #if os(Windows)
+            _ = path.withCString(encodedAs: UTF16.self) { SetFileAttributesW($0, attributes) }
+            #else
+            try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: path)
+            #endif
+            try? FileManager.default.removeItem(at: directory)
+        }
+        #if os(Windows)
+        XCTAssertTrue(path.withCString(encodedAs: UTF16.self) {
+            SetFileAttributesW($0, attributes | DWORD(FILE_ATTRIBUTE_READONLY))
+        })
+        #else
         // Opening re-asserts file modes, so only the immutable flag stays read-only.
         try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: path)
+        #endif
         let store = Database.testInstance(path: path)
         defer { store.close() }
         XCTAssertNotNil(store.openProblem)

@@ -1,5 +1,8 @@
 import XCTest
 import SQLite3
+#if os(Windows)
+import ucrt
+#endif
 @testable import ToastMonitor
 
 private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
@@ -43,7 +46,7 @@ final class CodexParserJSONTests: XCTestCase {
 
     /// Returns the `info` dicts of every token_count event in the fixture.
     private func tokenCountInfos() throws -> [[String: Any]] {
-        let lines = try String(contentsOfFile: fixturePath, encoding: .utf8).split(separator: "\n")
+        let lines = try String(contentsOfFile: fixturePath, encoding: .utf8).split(whereSeparator: \.isNewline)
         return try lines.compactMap { line in
             let obj = try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
             guard obj?["type"] as? String == "event_msg",
@@ -102,7 +105,7 @@ final class CodexParserJSONTests: XCTestCase {
         // chunk prescan → threads table. The fixture must carry turn_context
         // BEFORE every token_count event so that resolution succeeds, and the
         // session id must come from session_meta.
-        let lines = try String(contentsOfFile: fixturePath, encoding: .utf8).split(separator: "\n")
+        let lines = try String(contentsOfFile: fixturePath, encoding: .utf8).split(whereSeparator: \.isNewline)
         var sessionID: String?
         var contextModel: String?
         var tokenCountEvents = 0
@@ -133,8 +136,12 @@ final class CodexParserJSONTests: XCTestCase {
         let est = Pricing.estimate(model: contextModel, input: 3500, output: 421,
                                    cacheRead: 1200, cacheWrite: 80)
         XCTAssertNotNil(est, "gpt-5.6-sol must resolve to its own rate")
-        XCTAssertEqual(est!, 3500.0 / 1e6 * 4 + 421.0 / 1e6 * 20 + 1200.0 / 1e6 * 0.40 + 80.0 / 1e6 * 5,
-                       accuracy: 0.0001)
+        let inputCost: Double = 3500.0 / 1e6 * 4
+        let outputCost: Double = 421.0 / 1e6 * 20
+        let cacheReadCost: Double = 1200.0 / 1e6 * 0.40
+        let cacheWriteCost: Double = 80.0 / 1e6 * 5
+        let expectedCost = inputCost + outputCost + cacheReadCost + cacheWriteCost
+        XCTAssertEqual(est!, expectedCost, accuracy: 0.0001)
     }
 }
 
@@ -284,6 +291,7 @@ final class OpenCodeParserDeltaTests: XCTestCase {
     private var db: Database!
     private var dbPath = ""
     private var homeDir = ""
+    private var previousHome: String?
 
     override func setUp() {
         super.setUp()
@@ -293,11 +301,24 @@ final class OpenCodeParserDeltaTests: XCTestCase {
         homeDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("opencode-home-\(UUID().uuidString)").path
         try? FileManager.default.createDirectory(atPath: homeDir, withIntermediateDirectories: true)
+        previousHome = ProcessInfo.processInfo.environment["OPENCODE_HOME"]
+        #if os(Windows)
+        _ = _putenv_s("OPENCODE_HOME", homeDir)
+        #else
         setenv("OPENCODE_HOME", homeDir, 1)
+        #endif
     }
 
     override func tearDown() {
-        unsetenv("OPENCODE_HOME")
+        #if os(Windows)
+        if let previousHome {
+            _ = _putenv_s("OPENCODE_HOME", previousHome)
+        } else {
+            _ = _putenv_s("OPENCODE_HOME", "")
+        }
+        #else
+        if let previousHome { setenv("OPENCODE_HOME", previousHome, 1) } else { unsetenv("OPENCODE_HOME") }
+        #endif
         db.close()
         for suffix in ["", "-wal", "-shm"] {
             try? FileManager.default.removeItem(atPath: dbPath + suffix)

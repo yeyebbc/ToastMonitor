@@ -174,6 +174,7 @@ final class ClaudeQuotaTests: XCTestCase {
         XCTAssertLessThanOrEqual(delay, 3605)
     }
 
+    #if os(macOS)
     // MARK: - Credential read (never interactive)
 
     /// The guard that replaced kSecUseAuthenticationUIFail is process-wide,
@@ -243,6 +244,7 @@ final class ClaudeQuotaTests: XCTestCase {
         XCTAssertNil(ClaudeQuotaClient.runCapturing(path: "/nope/not-a-binary", arguments: [],
                                                     timeout: 5, maxBytes: 1024).data)
     }
+    #endif
 
     /// The blob `security -w` prints carries a trailing newline that SecItem
     /// never returns; the parser has to cope with both spellings.

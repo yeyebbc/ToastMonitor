@@ -1,0 +1,2 @@
+# Patch context uses significant spaces, including on blank lines.
+Windows/Patches/*.patch text eol=lf -whitespace

@@ -1,5 +1,7 @@
 import Foundation
+#if !os(Windows)
 import Darwin
+#endif
 
 struct DataRepairReceipt: Equatable, Sendable {
     let backupPath: String
@@ -10,7 +12,7 @@ struct DataRepairReceipt: Equatable, Sendable {
 
 enum DataMaintenance {
     static var directory: URL {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let base = FilePlatform.applicationSupport
         return base.appendingPathComponent("ToastMonitor/Backups", isDirectory: true)
     }
 
@@ -29,16 +31,15 @@ enum DataMaintenance {
         return Database.shared.previewLocalRebuild(claudePaths: logs.claude, codexPaths: logs.codex)
     }
 
-    /// Creates a protected, LZFSE-compressed SQLite snapshot (about a fifth
-    /// of the database size), then prunes by `retained(_:)`.
+    /// Creates a protected SQLite snapshot (LZFSE on macOS, raw SQLite on
+    /// Windows), then prunes by `retained(_:)`.
     static func createBackup(label: String = "manual", database: Database = .shared,
                              backupDirectory: URL? = nil, date: Date = Date()) -> String? {
         let directory = backupDirectory ?? Self.directory
         let fm = FileManager.default
         do {
-            try fm.createDirectory(at: directory, withIntermediateDirectories: true,
-                                   attributes: [.posixPermissions: 0o700])
-            try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+            try FilePlatform.createPrivateDirectory(directory)
+            try FilePlatform.protect(directory.path, directory: true)
         } catch {
             return nil
         }
@@ -67,11 +68,21 @@ enum DataMaintenance {
         return nil
     }
 
+    #if os(Windows)
+    // Raw SQLite, deliberately not advertised as LZFSE-compatible.
+    static let compressedExtension = "sqlite"
+    static let backupFormatDescription = "SQLite database (uncompressed)"
+    #else
     static let compressedExtension = "lzfse"
+    static let backupFormatDescription = "LZFSE-compressed SQLite database"
+    #endif
 
-    /// Writes `source` compressed to a new private file; never overwrites.
+    /// Writes a new private backup (compressed on macOS, raw on Windows); never overwrites.
     @discardableResult
     static func compress(_ source: URL, to destination: URL) -> Bool {
+        #if os(Windows)
+        return copyPrivateSQLite(source, to: destination)
+        #else
         guard let data = NSData(contentsOf: source),
               let packed = try? data.compressed(using: .lzfse) else { return false }
         let descriptor = Darwin.open(destination.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
@@ -85,15 +96,43 @@ enum DataMaintenance {
             try? FileManager.default.removeItem(at: destination)
             return false
         }
+        #endif
     }
 
-    /// Expands a compressed backup to a private file for restore.
+    /// Materializes a platform-format backup to a private SQLite file for restore.
     static func expand(_ source: URL, to destination: URL) -> Bool {
+        #if os(Windows)
+        return copyPrivateSQLite(source, to: destination)
+        #else
         guard let data = NSData(contentsOf: source),
               let raw = try? data.decompressed(using: .lzfse) else { return false }
         return FileManager.default.createFile(atPath: destination.path, contents: raw as Data,
                                               attributes: [.posixPermissions: 0o600])
+        #endif
     }
+
+    #if os(Windows)
+    /// The .db.sqlite suffix identifies a raw SQLite backup, not LZFSE data.
+    private static func copyPrivateSQLite(_ source: URL, to destination: URL) -> Bool {
+        guard isSQLiteFile(source), FilePlatform.reservePrivateFile(destination.path) else { return false }
+        var completed = false
+        defer { if !completed { try? FileManager.default.removeItem(at: destination) } }
+        do {
+            let input = try FileHandle(forReadingFrom: source)
+            defer { try? input.close() }
+            let output = try FileHandle(forWritingTo: destination)
+            defer { try? output.close() }
+            while let chunk = try input.read(upToCount: 64 * 1024), !chunk.isEmpty {
+                try output.write(contentsOf: chunk)
+            }
+            try output.synchronize()
+            completed = true
+            return true
+        } catch {
+            return false
+        }
+    }
+    #endif
 
     /// Compresses backups written before compression existed, keeping their
     /// dates so retention still orders them correctly.
@@ -116,15 +155,14 @@ enum DataMaintenance {
         let fm = FileManager.default
         do {
             let parent = destination.deletingLastPathComponent()
-            try fm.createDirectory(at: parent, withIntermediateDirectories: true,
-                                   attributes: [.posixPermissions: 0o700])
+            try FilePlatform.createPrivateDirectory(parent)
             if fm.fileExists(atPath: destination.path) {
                 guard (try destination.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true) else {
                     return false
                 }
             }
             guard database.exportRedacted(to: destination.path) else { return false }
-            try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
+            try FilePlatform.protect(destination.path)
             return true
         } catch {
             return false
@@ -158,13 +196,15 @@ enum DataMaintenance {
     /// The broken file stays beside the new one.
     static func recover(from backup: URL?, database: Database = .shared) -> Bool {
         guard let backup else { return database.replaceUnusableStore(with: nil) }
+        #if os(Windows)
+        guard isBackupFile(backup) else { return false }
+        #endif
         guard backup.pathExtension == compressedExtension else {
             return database.replaceUnusableStore(with: backup.path)
         }
         let fm = FileManager.default
         let workspace = fm.temporaryDirectory.appendingPathComponent("tm-expand-\(UUID().uuidString)")
-        guard (try? fm.createDirectory(at: workspace, withIntermediateDirectories: true,
-                                       attributes: [.posixPermissions: 0o700])) != nil else { return false }
+        guard (try? FilePlatform.createPrivateDirectory(workspace)) != nil else { return false }
         defer { try? fm.removeItem(at: workspace) }
         let expanded = workspace.appendingPathComponent("backup.db")
         guard expand(backup, to: expanded), isSQLiteFile(expanded) else { return false }
@@ -176,6 +216,9 @@ enum DataMaintenance {
         let directory = backupDirectory ?? Self.directory
         guard isManagedBackup(path, in: directory), isSafeDatabaseFile(path) else { return nil }
         let url = URL(fileURLWithPath: path)
+        #if os(Windows)
+        guard isBackupFile(url) else { return nil }
+        #endif
         // A broken store cannot be snapshotted first, and needs no snapshot.
         if database.openProblem != nil {
             return recover(from: url, database: database) ? path : nil
@@ -185,8 +228,7 @@ enum DataMaintenance {
         }
         let fm = FileManager.default
         let workspace = fm.temporaryDirectory.appendingPathComponent("tm-expand-\(UUID().uuidString)")
-        guard (try? fm.createDirectory(at: workspace, withIntermediateDirectories: true,
-                                       attributes: [.posixPermissions: 0o700])) != nil else { return nil }
+        guard (try? FilePlatform.createPrivateDirectory(workspace)) != nil else { return nil }
         defer { try? fm.removeItem(at: workspace) }
         let expanded = workspace.appendingPathComponent("backup.db")
         guard expand(url, to: expanded) else { return nil }
@@ -252,13 +294,10 @@ enum DataMaintenance {
         let canonical = destination.deletingLastPathComponent().resolvingSymlinksInPath()
             .appendingPathComponent(destination.lastPathComponent).standardizedFileURL
         let live = URL(fileURLWithPath: databasePath).resolvingSymlinksInPath().standardizedFileURL
-        let protected = Set(["", "-wal", "-shm", "-journal"].map { live.path + $0 })
-        guard !protected.contains(canonical.path),
-              !protected.contains(canonical.resolvingSymlinksInPath().path) else { return false }
-        var sourceInfo = stat()
-        var targetInfo = stat()
-        if stat(live.path, &sourceInfo) == 0, stat(canonical.path, &targetInfo) == 0,
-           sourceInfo.st_dev == targetInfo.st_dev, sourceInfo.st_ino == targetInfo.st_ino {
+        let protected = Set(["", "-wal", "-shm", "-journal"].map { FilePlatform.comparisonPath(live.path + $0) })
+        guard !protected.contains(FilePlatform.comparisonPath(canonical.path)),
+              !protected.contains(FilePlatform.comparisonPath(canonical.resolvingSymlinksInPath().path)) else { return false }
+        if FilePlatform.sameFile(live.path, canonical.path) {
             return false
         }
         return true
@@ -288,9 +327,13 @@ enum DataMaintenance {
         switch url.pathExtension {
         case "db": return isSQLiteFile(url)
         case compressedExtension:
+            #if os(Windows)
+            return isSQLiteFile(url)
+            #else
             guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
             defer { try? handle.close() }
             return (try? handle.read(upToCount: 3)) == Data("bvx".utf8)
+            #endif
         default: return false
         }
     }
@@ -348,8 +391,8 @@ enum DataMaintenance {
     }
 
     private static func isManagedBackup(_ path: String, in directory: URL = DataMaintenance.directory) -> Bool {
-        let candidate = URL(fileURLWithPath: path).standardizedFileURL.path
-        let root = directory.standardizedFileURL.path + "/"
+        let candidate = FilePlatform.comparisonPath(URL(fileURLWithPath: path).standardizedFileURL.path)
+        let root = FilePlatform.comparisonPath(directory.standardizedFileURL.path) + "/"
         return candidate.hasPrefix(root)
     }
 

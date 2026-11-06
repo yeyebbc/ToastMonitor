@@ -1,4 +1,7 @@
 import XCTest
+#if os(Windows)
+import ucrt
+#endif
 @testable import ToastMonitor
 
 final class ReviewRegressionTests: XCTestCase {
@@ -71,9 +74,22 @@ final class ReviewRegressionTests: XCTestCase {
         let tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("dsh-regression-\(UUID().uuidString)").path
         try FileManager.default.createDirectory(atPath: tempDir, withIntermediateDirectories: true)
+        let previousDSHHome = ProcessInfo.processInfo.environment["DSH_HOME"]
+        #if os(Windows)
+        _ = _putenv_s("DSH_HOME", tempDir)
+        #else
         setenv("DSH_HOME", tempDir, 1)
+        #endif
         defer {
-            unsetenv("DSH_HOME")
+            #if os(Windows)
+            if let previousDSHHome {
+                _ = _putenv_s("DSH_HOME", previousDSHHome)
+            } else {
+                _ = _putenv_s("DSH_HOME", "")
+            }
+            #else
+            if let previousDSHHome { setenv("DSH_HOME", previousDSHHome, 1) } else { unsetenv("DSH_HOME") }
+            #endif
             try? FileManager.default.removeItem(atPath: tempDir)
         }
         let body = """

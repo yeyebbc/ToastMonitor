@@ -1,4 +1,6 @@
+#if os(macOS)
 import AppKit
+#endif
 import Foundation
 
 /// Retry pacing for collector sources. A source that keeps failing is
@@ -79,7 +81,7 @@ final class CollectorEngine: @unchecked Sendable {
     private var timer: DispatchSourceTimer?
     private var pending = false
     private var started = false
-    private var lastScanStart: CFAbsoluteTime = 0
+    private var lastScanStart: TimeInterval = 0
     private var foreground = false
     private var popoverVisible = false
     private var dashboardVisible = false
@@ -154,8 +156,17 @@ final class CollectorEngine: @unchecked Sendable {
                 }
             }
         }
+        #if os(macOS)
         let workspace = NSWorkspace.shared.notificationCenter
-        workspace.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: nil) { [weak self] _ in
+        let sleepNotification = NSWorkspace.willSleepNotification
+        let wakeNotification = NSWorkspace.didWakeNotification
+        #else
+        WindowsLifecycle.start()
+        let workspace = NotificationCenter.default
+        let sleepNotification = WindowsLifecycle.willSleep
+        let wakeNotification = WindowsLifecycle.didWake
+        #endif
+        workspace.addObserver(forName: sleepNotification, object: nil, queue: nil) { [weak self] _ in
             self?.queue.async { [weak self] in
                 guard let self else { return }
                 self.pausedForSleep = true
@@ -164,7 +175,7 @@ final class CollectorEngine: @unchecked Sendable {
                 self.installedInterval = 0
             }
         }
-        workspace.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: nil) { [weak self] _ in
+        workspace.addObserver(forName: wakeNotification, object: nil, queue: nil) { [weak self] _ in
             self?.queue.async { [weak self] in
                 guard let self else { return }
                 self.pausedForSleep = false
@@ -197,7 +208,11 @@ final class CollectorEngine: @unchecked Sendable {
     /// 30s after an idle scan, and 60s on Low Power Mode. Sleep cancels it.
     private func desiredInterval() -> TimeInterval {
         if foreground { return 1 }
+        #if os(macOS)
         if ProcessInfo.processInfo.isLowPowerModeEnabled { return 60 }
+        #else
+        if WindowsLifecycle.isLowPowerModeEnabled { return 60 }
+        #endif
         if lastScanWasIdle { return 30 }
         return 5
     }
@@ -236,7 +251,7 @@ final class CollectorEngine: @unchecked Sendable {
                 return
             }
             guard !pending else { return }
-            let now = CFAbsoluteTimeGetCurrent()
+            let now = Date.timeIntervalSinceReferenceDate
             guard now - lastScanStart > 2 else { return }
             pending = true
             queue.asyncAfter(deadline: .now() + 0.5) { [self] in
@@ -251,7 +266,7 @@ final class CollectorEngine: @unchecked Sendable {
                  completion: (@MainActor @Sendable (ScanReceipt) -> Void)? = nil) {
         dispatchPrecondition(condition: .onQueue(queue))
         let startedAt = Date()
-        let t0 = CFAbsoluteTimeGetCurrent()
+        let t0 = Date.timeIntervalSinceReferenceDate
         lastScanStart = t0
 
         var turnCount = 0
@@ -262,10 +277,10 @@ final class CollectorEngine: @unchecked Sendable {
                     sourcePaths: [String],
                     scan: (any ParserStateStore) -> (turns: [TurnRecord], sessions: [SessionInfo]),
                     signaturePath: String? = nil, signaturePaths: [String] = []) {
-            let sourceStart = CFAbsoluteTimeGetCurrent()
+            let sourceStart = Date.timeIntervalSinceReferenceDate
             if sourceRetry.isWaiting(source) { return }
             guard preflight() else {
-                let duration = (CFAbsoluteTimeGetCurrent() - sourceStart) * 1000
+                let duration = (Date.timeIntervalSinceReferenceDate - sourceStart) * 1000
                 Task { @MainActor in
                     SourceHealthHub.shared.recordIdle(tool: source, durationMs: duration)
                 }
@@ -277,7 +292,7 @@ final class CollectorEngine: @unchecked Sendable {
                                                  scan: scan)
             let turnRows = prepared.turns.count
             let sessionRows = prepared.sessions.count
-            let duration = (CFAbsoluteTimeGetCurrent() - sourceStart) * 1000
+            let duration = (Date.timeIntervalSinceReferenceDate - sourceStart) * 1000
             if let problem = prepared.problem {
                 failedSources.append(source)
                 sourceRetry.failed(source)
@@ -392,7 +407,7 @@ final class CollectorEngine: @unchecked Sendable {
             installTimer()
         }
 
-        let elapsed = CFAbsoluteTimeGetCurrent() - t0
+        let elapsed = Date.timeIntervalSinceReferenceDate - t0
         if turnCount > 0 || sessionCount > 0 || elapsed > 1 {
             NSLog("[ToastMonitor] scan: %d turns, %d sessions, %.1fms",
                   turnCount, sessionCount, elapsed * 1000)

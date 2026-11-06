@@ -1,5 +1,8 @@
 import Foundation
 import SQLite3
+#if os(Windows)
+import ucrt
+#endif
 
 /// OpenCode parser (modern format): ~/.local/share/opencode/opencode.db
 /// `session` table carries cumulative totals: cost, tokens_input/output/reasoning/cache_read/cache_write.
@@ -20,7 +23,11 @@ enum OpenCodeParser {
         if let raw = getenv("XDG_DATA_HOME"), let xdg = String(validatingUTF8: raw), !xdg.isEmpty {
             candidates.append((xdg as NSString).appendingPathComponent("opencode/opencode.db"))
         }
+        #if os(Windows)
+        candidates.append(FilePlatform.applicationSupport.appendingPathComponent("opencode/opencode.db").path)
+        #else
         candidates.append(userHome.appendingPathComponent("Library/Application Support/opencode/opencode.db").path)
+        #endif
         candidates.append(userHome.appendingPathComponent(".local/share/opencode/opencode.db").path)
         return candidates.first { fm.fileExists(atPath: $0) } ?? candidates[candidates.count - 1]
     }

@@ -20,13 +20,13 @@ import SQLite3
 ///
 /// Hermes logs only whole-call latency, so it is not measured.
 enum PerfCollector {
-    static let interval: CFAbsoluteTime = 60
-    private static var lastRun: CFAbsoluteTime = 0
+    static let interval: TimeInterval = 60
+    private static var lastRun: TimeInterval = 0
 
     /// Called from the collector queue on every tick.
     static func maybeRun(claudeFiles: [String], codexFiles: [String], ompFiles: [String],
                          database: Database = .shared) {
-        let now = CFAbsoluteTimeGetCurrent()
+        let now = Date.timeIntervalSinceReferenceDate
         guard now - lastRun >= interval else { return }
         lastRun = now
         // The first run backfills every transcript; spread that over

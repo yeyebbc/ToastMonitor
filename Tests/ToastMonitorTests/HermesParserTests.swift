@@ -1,5 +1,8 @@
 import XCTest
 import SQLite3
+#if os(Windows)
+import ucrt
+#endif
 @testable import ToastMonitor
 
 private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
@@ -12,6 +15,7 @@ final class HermesParserTests: XCTestCase {
     private var db: Database!
     private var dbPath = ""
     private var homeDir = ""
+    private var previousHome: String?
 
     override func setUp() {
         super.setUp()
@@ -21,11 +25,24 @@ final class HermesParserTests: XCTestCase {
         homeDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("hermes-home-\(UUID().uuidString)").path
         try? FileManager.default.createDirectory(atPath: homeDir, withIntermediateDirectories: true)
+        previousHome = ProcessInfo.processInfo.environment["HERMES_HOME"]
+        #if os(Windows)
+        _ = _putenv_s("HERMES_HOME", homeDir)
+        #else
         setenv("HERMES_HOME", homeDir, 1)
+        #endif
     }
 
     override func tearDown() {
-        unsetenv("HERMES_HOME")
+        #if os(Windows)
+        if let previousHome {
+            _ = _putenv_s("HERMES_HOME", previousHome)
+        } else {
+            _ = _putenv_s("HERMES_HOME", "")
+        }
+        #else
+        if let previousHome { setenv("HERMES_HOME", previousHome, 1) } else { unsetenv("HERMES_HOME") }
+        #endif
         db.close()
         for suffix in ["", "-wal", "-shm"] {
             try? FileManager.default.removeItem(atPath: dbPath + suffix)

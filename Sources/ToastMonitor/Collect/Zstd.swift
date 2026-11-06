@@ -1,5 +1,9 @@
 import Foundation
+#if os(Windows)
+import StorageSupport
+#else
 import Darwin
+#endif
 
 /// Best-effort zstd decompression without third-party libraries.
 ///
@@ -22,12 +26,16 @@ enum Zstd {
     private static var cachedExecutable: String?
 
     /// Locations independent of the caller's `PATH`, tried after a PATH hit.
+    #if os(Windows)
+    private static let fixedCandidates: [String] = []
+    #else
     private static let fixedCandidates = [
         "/opt/homebrew/bin/zstd", // Apple Silicon Homebrew
         "/usr/local/bin/zstd",    // Intel Homebrew
         "/opt/local/bin/zstd",    // MacPorts
         "/usr/bin/zstd",          // system image (rare)
     ]
+    #endif
 
     /// Absolute path to a `zstd` executable, or nil.
     /// The lookup runs once per process; installs/uninstalls of the CLI are
@@ -37,8 +45,15 @@ enum Zstd {
         if checked { return cachedExecutable }
         checked = true
         let path = ProcessInfo.processInfo.environment["PATH"] ?? ""
-        for dir in path.split(separator: ":") where !dir.isEmpty {
-            let candidate = (String(dir) as NSString).appendingPathComponent("zstd")
+        #if os(Windows)
+        let separator: Character = ";"
+        let executableName = "zstd.exe"
+        #else
+        let separator: Character = ":"
+        let executableName = "zstd"
+        #endif
+        for dir in path.split(separator: separator) where !dir.isEmpty {
+            let candidate = (String(dir) as NSString).appendingPathComponent(executableName)
             if FileManager.default.isExecutableFile(atPath: candidate) {
                 cachedExecutable = candidate
                 return candidate
@@ -92,7 +107,9 @@ enum Zstd {
         let stdout = Pipe()
         // Killing a decoder can close its input during a blocked write. Keep
         // that failure local to this descriptor instead of raising SIGPIPE.
+        #if !os(Windows)
         guard fcntl(stdin.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1) == 0 else { return nil }
+        #endif
         process.standardInput = stdin
         process.standardOutput = stdout
         process.standardError = FileHandle.nullDevice
@@ -110,7 +127,13 @@ enum Zstd {
             guard let process, process.isRunning else { return }
             process.terminate()
             DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2) { [weak process] in
-                if let process, process.isRunning { Darwin.kill(process.processIdentifier, SIGKILL) }
+                if let process, process.isRunning {
+                    #if os(Windows)
+                    tm_kill_process(UInt32(process.processIdentifier))
+                    #else
+                    Darwin.kill(process.processIdentifier, SIGKILL)
+                    #endif
+                }
             }
         }
         watchdog.resume()

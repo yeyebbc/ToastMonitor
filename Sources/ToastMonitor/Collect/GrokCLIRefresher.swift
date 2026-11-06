@@ -29,6 +29,9 @@ enum GrokCLIRefresher {
         guard let binary = binary ?? ClaudeCLIRefresher.locateBinary(named: "grok") else {
             return .failed("binary not found")
         }
+#if os(Windows)
+        return WindowsCLI.run(binary: binary, arguments: ["models"], timeout: timeout)
+#else
         // Same Gatekeeper reason as ClaudeCLIRefresher: a quarantined build
         // that is not notarized would raise a dialog on every attempt.
         guard !ClaudeCLIRefresher.launchBlocked(binary) else { return .failed("blocked by Gatekeeper") }
@@ -57,5 +60,6 @@ enum GrokCLIRefresher {
             return .failed("timed out after \(Int(timeout))s")
         }
         return process.terminationStatus == 0 ? .completed : .failed("exit \(process.terminationStatus)")
+        #endif
     }
 }

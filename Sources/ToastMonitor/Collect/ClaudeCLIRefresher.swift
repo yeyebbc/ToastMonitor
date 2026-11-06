@@ -1,6 +1,8 @@
 import Foundation
+#if os(macOS)
 import Darwin
 import Security
+#endif
 
 /// Delegates Claude Code's OAuth token refresh to the real `claude` CLI
 /// instead of ToastMonitor implementing an OAuth refresh flow of its own.
@@ -60,6 +62,9 @@ enum ClaudeCLIRefresher {
                                          env: [String: String] = ProcessInfo.processInfo.environment,
                                          home: String = NSHomeDirectory(),
                                          fixedCandidates: [String]? = nil) -> String? {
+#if os(Windows)
+        return WindowsCLI.locate(named: name, env: env, home: home, fixedCandidates: fixedCandidates)
+#else
         let fixed = fixedCandidates ?? ["/opt/homebrew/bin/\(name)", "/usr/local/bin/\(name)"]
         // ~/.grok/bin is where Grok's own installer puts it; an app opened
         // from Finder doesn't get the PATH line that installer adds.
@@ -73,8 +78,10 @@ enum ClaudeCLIRefresher {
             if FileManager.default.isExecutableFile(atPath: candidate) { return candidate }
         }
         return nil
+        #endif
     }
 
+#if os(macOS)
     /// True when the file a path resolves to carries a quarantine flag the
     /// user has not approved yet.
     nonisolated static func isQuarantined(_ path: String) -> Bool {
@@ -107,6 +114,7 @@ enum ClaudeCLIRefresher {
                                           requirement) == errSecSuccess
     }
 
+#endif
     /// The xattr reads "flags;timestamp;agent;uuid" with hex flags; 0x40
     /// marks a file the user already approved to open.
     nonisolated static func quarantineBlocksLaunch(_ value: String) -> Bool {
@@ -146,6 +154,10 @@ enum ClaudeCLIRefresher {
 
     nonisolated static func probe(binary: String?, attempt: Int,
                                   renewed: (@Sendable () -> Bool)?) -> CLIRenewalOutcome {
+#if os(Windows)
+        guard let binary = binary ?? locateBinary() else { return .failed("binary not found") }
+        return WindowsCLI.refreshClaude(binary: binary, arguments: arguments(attempt: attempt), renewed: renewed)
+#else
         guard let binary = binary ?? locateBinary() else { return .failed("binary not found") }
         // A quarantined build that is not notarized makes Gatekeeper put up
         // a "cannot verify" dialog on every attempt, while a Terminal run is
@@ -259,12 +271,15 @@ enum ClaudeCLIRefresher {
         if succeeded { return .completed }
         return .failed(exitedEarly ? "exited with status \(process.terminationStatus)"
                                    : "no account info within \(Int(probeTimeout))s")
+        #endif
     }
 
+#if os(macOS)
     private static func writeToFD(_ fd: Int32, _ text: String) {
         let bytes = Array(text.utf8)
         _ = bytes.withUnsafeBufferPointer { write(fd, $0.baseAddress, $0.count) }
     }
+#endif
 
     /// Strips ANSI escapes and collapses everything to lowercase
     /// letters/digits, matching the "does this recognisable phrase appear

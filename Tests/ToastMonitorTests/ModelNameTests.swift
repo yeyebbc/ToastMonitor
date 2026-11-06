@@ -101,15 +101,15 @@ final class AnalysisCSVTests: XCTestCase {
     }
     @MainActor
     func testCSVTextNeutralizesFormulaPrefixesAndPreservesEscaping() {
-        XCTAssertEqual(UsageAnalysisView.csvField("=1+1"), "'=1+1")
-        XCTAssertEqual(UsageAnalysisView.csvField("-gpt"), "'-gpt")
-        XCTAssertEqual(UsageAnalysisView.csvField("  +formula"), "'  +formula")
-        XCTAssertEqual(UsageAnalysisView.csvField("@SUM(A1)"), "'@SUM(A1)")
-        XCTAssertEqual(UsageAnalysisView.csvField("\tlabel"), "'\tlabel")
-        XCTAssertEqual(UsageAnalysisView.csvField("\rlabel"), "\"'\rlabel\"")
-        XCTAssertEqual(UsageAnalysisView.csvField("claude-sonnet"), "claude-sonnet")
-        XCTAssertEqual(UsageAnalysisView.csvField("a,\"b\""), "\"a,\"\"b\"\"\"")
-        XCTAssertEqual(UsageAnalysisView.csvField("-1.250000", text: false), "-1.250000")
+        XCTAssertEqual(AnalysisCSVRow.csvField("=1+1"), "'=1+1")
+        XCTAssertEqual(AnalysisCSVRow.csvField("-gpt"), "'-gpt")
+        XCTAssertEqual(AnalysisCSVRow.csvField("  +formula"), "'  +formula")
+        XCTAssertEqual(AnalysisCSVRow.csvField("@SUM(A1)"), "'@SUM(A1)")
+        XCTAssertEqual(AnalysisCSVRow.csvField("\tlabel"), "'\tlabel")
+        XCTAssertEqual(AnalysisCSVRow.csvField("\rlabel"), "\"'\rlabel\"")
+        XCTAssertEqual(AnalysisCSVRow.csvField("claude-sonnet"), "claude-sonnet")
+        XCTAssertEqual(AnalysisCSVRow.csvField("a,\"b\""), "\"a,\"\"b\"\"\"")
+        XCTAssertEqual(AnalysisCSVRow.csvField("-1.250000", text: false), "-1.250000")
     }
 
 }

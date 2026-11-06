@@ -15,10 +15,13 @@ final class FileScannerTests: XCTestCase {
     }
 
     func testTokenCountRejectsMalformedValuesAndAcceptsCeiling() {
-        for value: Any in [Int64.max, UInt64.max, Int64.min, "12", 1.5, Double.infinity, Double.nan, true] {
+        for value: Any in [Int64.max, UInt64.max, Int64.min, "12", 1.5, Double.infinity, Double.nan, true, false, NSNumber(value: true), NSNumber(value: false)] {
             XCTAssertEqual(FileScanner.tokenCount(value), 0)
         }
         XCTAssertEqual(FileScanner.tokenCount(nil), 0)
+        XCTAssertEqual(FileScanner.tokenCount(0), 0)
+        XCTAssertEqual(FileScanner.tokenCount(1), 1)
+        XCTAssertEqual(FileScanner.tokenCount(Int8(1)), 1)
         XCTAssertEqual(FileScanner.tokenCount(42), 42)
         XCTAssertEqual(FileScanner.tokenCount(TurnRecord.maxTokens), TurnRecord.maxTokens)
         XCTAssertEqual(FileScanner.tokenCount(TurnRecord.maxTokens + 1), 0)
@@ -127,12 +130,17 @@ final class FileScannerTests: XCTestCase {
 
         var retained: [[String: Any]] = []
         var offsets: [Int64] = []
-        let cursor = autoreleasepool {
+        func scan() -> Int64 {
             FileScanner.forEachNewJSONLine(path: path, fromOffset: 0) {
                 retained.append($0.obj)
                 offsets.append($0.offset)
             }
         }
+        #if os(macOS)
+        let cursor = autoreleasepool(invoking: scan)
+        #else
+        let cursor = scan()
+        #endif
 
         XCTAssertEqual(cursor, Int64(bytes.count))
         XCTAssertEqual(retained.count, lines.count)

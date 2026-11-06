@@ -17,6 +17,7 @@ import tempfile
 
 
 SCANNER = "Sources/ToastMonitor/Collect/FileScanner.swift"
+FILE_PLATFORM = "Sources/ToastMonitor/Core/FilePlatform.swift"
 HARNESS = r'''
 import Foundation
 import Darwin
@@ -102,8 +103,16 @@ def main():
             scanner = work / f"{label}.swift"
             scanner.write_bytes(source)
             binary = work / label
-            subprocess.run(["xcrun", "swiftc", "-O", str(scanner), str(harness),
-                            "-o", str(binary)], env=environment, check=True)
+            dependencies = []
+            if b"FilePlatform." in source:
+                adapter = work / f"{label}-FilePlatform.swift"
+                adapter.write_bytes(
+                    subprocess.check_output(["git", "show", f"{args.baseline}:{FILE_PLATFORM}"], cwd=root)
+                    if label == "before" else (root / FILE_PLATFORM).read_bytes()
+                )
+                dependencies.append(str(adapter))
+            subprocess.run(["xcrun", "swiftc", "-O", str(scanner), *dependencies,
+                            str(harness), "-o", str(binary)], env=environment, check=True)
             binaries[label] = binary
 
         samples = {label: [] for label in binaries}

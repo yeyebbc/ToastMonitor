@@ -89,8 +89,6 @@ enum Format {
     private static let moneyWholeFormatter: NumberFormatter = {
         let f = NumberFormatter()
         f.numberStyle = .decimal
-        f.maximumFractionDigits = 2
-        f.minimumFractionDigits = 0
         f.usesGroupingSeparator = true
         f.locale = Locale(identifier: "en_US_POSIX")
         return f
@@ -99,7 +97,10 @@ enum Format {
     private static func moneyWholeString(_ v: Double) -> String {
         formatterLock.lock(); defer { formatterLock.unlock() }
         // Cents show as two digits or not at all: "$1,418.90", never "$1,418.9".
-        moneyWholeFormatter.minimumFractionDigits = (v * 100).rounded().truncatingRemainder(dividingBy: 100) == 0 ? 0 : 2
+        // Corelibs Foundation 6.1 skips maximumFractionDigits when the minimum
+        // is positive. An ICU pattern sets both bounds on every platform.
+        moneyWholeFormatter.positiveFormat = (v * 100).rounded().truncatingRemainder(dividingBy: 100) == 0
+            ? "#,##0" : "#,##0.00"
         return moneyWholeFormatter.string(from: NSNumber(value: v)) ?? String(format: "%.2f", v)
     }
 

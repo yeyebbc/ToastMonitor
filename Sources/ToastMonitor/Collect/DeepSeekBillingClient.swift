@@ -1,5 +1,12 @@
 import Foundation
+#if os(macOS)
 import Combine
+#else
+import SwiftCrossUI
+#endif
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 @MainActor
 final class DeepSeekBillingClient: ObservableObject {

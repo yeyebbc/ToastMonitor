@@ -1,3 +1,4 @@
+#if os(macOS)
 import AppKit
 import Foundation
 import Darwin
@@ -151,3 +152,4 @@ enum DeepSeekBrowserSession {
         return data
     }
 }
+#endif

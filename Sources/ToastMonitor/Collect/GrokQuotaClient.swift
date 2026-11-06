@@ -1,5 +1,13 @@
 import Foundation
+#if os(macOS)
+import CoreFoundation
 import Combine
+#else
+import SwiftCrossUI
+#endif
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 /// Grok plan (SuperGrok, now sold as part of The X Subscription) weekly quota via the Grok CLI
 /// billing proxy (same approach as CodexBar): reads the bearer token `grok login` stores in
@@ -453,8 +461,17 @@ final class GrokQuotaClient: ObservableObject {
         return cents / 100
     }
 
+    #if os(Windows)
+    private nonisolated static let trueNumber = NSNumber(value: true)
+    private nonisolated static let falseNumber = NSNumber(value: false)
+    #endif
     private nonisolated static func finite(_ raw: Any?) -> Double? {
-        guard let n = raw as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() else { return nil }
+        guard let n = raw as? NSNumber else { return nil }
+        #if os(Windows)
+        guard n !== trueNumber, n !== falseNumber else { return nil }
+        #else
+        guard CFGetTypeID(n) != CFBooleanGetTypeID() else { return nil }
+        #endif
         let d = n.doubleValue
         return d.isFinite ? d : nil
     }

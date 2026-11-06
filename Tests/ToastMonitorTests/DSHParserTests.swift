@@ -1,10 +1,14 @@
 import XCTest
+#if os(Windows)
+import ucrt
+#endif
 @testable import ToastMonitor
 
 final class DSHParserTests: XCTestCase {
     private var dbPath = ""
     private var db: Database!
     private var tempDir = ""
+    private var previousHome: String?
 
     override func setUp() {
         super.setUp()
@@ -16,11 +20,24 @@ final class DSHParserTests: XCTestCase {
         try? FileManager.default.createDirectory(atPath: tempDir, withIntermediateDirectories: true)
         // Point the parser's DSH root at the temp dir so path-based tests
         // never touch the real ~/.dsh.
+        previousHome = ProcessInfo.processInfo.environment["DSH_HOME"]
+        #if os(Windows)
+        _ = _putenv_s("DSH_HOME", tempDir)
+        #else
         setenv("DSH_HOME", tempDir, 1)
+        #endif
     }
 
     override func tearDown() {
-        unsetenv("DSH_HOME")
+        #if os(Windows)
+        if let previousHome {
+            _ = _putenv_s("DSH_HOME", previousHome)
+        } else {
+            _ = _putenv_s("DSH_HOME", "")
+        }
+        #else
+        if let previousHome { setenv("DSH_HOME", previousHome, 1) } else { unsetenv("DSH_HOME") }
+        #endif
         db.close()
         for suffix in ["", "-wal", "-shm"] {
             try? FileManager.default.removeItem(atPath: dbPath + suffix)

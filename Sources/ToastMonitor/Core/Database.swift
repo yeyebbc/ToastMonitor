@@ -1,6 +1,8 @@
 import Foundation
 import SQLite3
+#if !os(Windows)
 import Darwin
+#endif
 
 /// NULL-safe SQLite text read. `String(cString:)` crashes when the column is NULL.
 enum SQLiteText {
@@ -76,9 +78,11 @@ final class Database: @unchecked Sendable {
             return
         }
         let fm = FileManager.default
-        let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let base = FilePlatform.applicationSupport
         let dir = base.appendingPathComponent("ToastMonitor", isDirectory: true)
+        #if !os(Windows)
         try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        #endif
         openLocked(dir.appendingPathComponent("toastmonitor.db").path)
     }
 
@@ -115,6 +119,24 @@ final class Database: @unchecked Sendable {
         scanStatesCache = nil
         let fm = FileManager.default
         let dir = (path as NSString).deletingLastPathComponent
+        #if os(Windows)
+        do {
+            try FilePlatform.createPrivateDirectory(URL(fileURLWithPath: dir, isDirectory: true))
+            try FilePlatform.protect(dir, directory: true)
+            if fm.fileExists(atPath: path) {
+                try FilePlatform.protect(path)
+            } else if !FilePlatform.reservePrivateFile(path) {
+                throw CocoaError(.fileWriteNoPermission)
+            }
+            for suffix in ["-wal", "-shm", "-journal"] where fm.fileExists(atPath: path + suffix) {
+                try FilePlatform.protect(path + suffix)
+            }
+        } catch {
+            dbPath = path
+            openProblem = .damaged("Cannot secure database: \(error.localizedDescription)")
+            return
+        }
+        #else
         // Create with the private mode up front (attributesForDirectory) so
         // there is no window where the dir/file is world-readable.
         try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true,
@@ -122,6 +144,7 @@ final class Database: @unchecked Sendable {
         // Usage metadata can reveal project names; keep the store private to
         // the current user even when the directory pre-existed.
         try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir)
+        #endif
         dbPath = path
 
         var handle: OpaquePointer?
@@ -136,7 +159,7 @@ final class Database: @unchecked Sendable {
         sqlite3_busy_timeout(db, 3000) // WAL writers don't block, but reads
                                        // during a long migration would fail
                                        // fast without this; wait up to 3s.
-        try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: dbPath)
+        try? FilePlatform.protect(dbPath)
         exec("PRAGMA journal_mode=WAL;")
         exec("PRAGMA synchronous=NORMAL;")
         exec("PRAGMA foreign_keys=ON;")
@@ -203,7 +226,7 @@ final class Database: @unchecked Sendable {
             }
             if let source {
                 try fm.copyItem(atPath: source, toPath: dbPath)
-                try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: dbPath)
+                try FilePlatform.protect(dbPath)
             }
         } catch {
             NSLog("[ToastMonitor] store replacement failed: %@", error.localizedDescription)
@@ -1746,7 +1769,7 @@ final class Database: @unchecked Sendable {
         return sqlite3_step(stmt) == SQLITE_ROW ? Int(sqlite3_column_int64(stmt, 0)) : 0
     }
 
-    func sessions(tool: ToolKind? = nil, limit: Int = 100) -> [SessionRow] {
+    func sessions(tool: ToolKind? = nil, limit: Int = 100, offset: Int = 0) -> [SessionRow] {
         lock.lock(); defer { lock.unlock() }
         var out: [SessionRow] = []
         guard let db else { return out }
@@ -1760,7 +1783,7 @@ final class Database: @unchecked Sendable {
         WHERE \(Self.listedSession)
         """
         if tool != nil { sql += " AND s.tool=?" }
-        sql += " GROUP BY s.tool, s.session_id ORDER BY last_seen DESC LIMIT ?;"
+        sql += " GROUP BY s.tool, s.session_id ORDER BY last_seen DESC LIMIT ? OFFSET ?;"
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return out }
         var idx: Int32 = 1
@@ -1769,6 +1792,7 @@ final class Database: @unchecked Sendable {
             idx += 1
         }
         sqlite3_bind_int64(stmt, idx, Int64(limit))
+        sqlite3_bind_int64(stmt, idx + 1, Int64(offset))
         while sqlite3_step(stmt) == SQLITE_ROW {
             out.append(SessionRow(
                 tool: String(cString: sqlite3_column_text(stmt, 0)),
@@ -2580,9 +2604,7 @@ final class Database: @unchecked Sendable {
         guard let db else { return false }
         let fm = FileManager.default
         if !overwrite {
-            let descriptor = Darwin.open(destination, O_RDWR | O_CREAT | O_EXCL, 0o600)
-            guard descriptor >= 0 else { return false }
-            Darwin.close(descriptor)
+            guard FilePlatform.reservePrivateFile(destination) else { return false }
         }
         var completed = false
         defer {
@@ -2593,9 +2615,11 @@ final class Database: @unchecked Sendable {
         // then cannot widen permissions either. An existing destination is
         // left untouched (export targets) — only its mode is re-asserted.
         if !fm.fileExists(atPath: destination) {
-            guard fm.createFile(atPath: destination, contents: nil,
-                                attributes: [.posixPermissions: 0o600]) else { return false }
+            guard FilePlatform.reservePrivateFile(destination) else { return false }
         }
+        #if os(Windows)
+        do { try FilePlatform.protect(destination) } catch { return false }
+        #endif
         var target: OpaquePointer?
         guard sqlite3_open_v2(destination, &target, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK,
               let target else {
@@ -2607,7 +2631,7 @@ final class Database: @unchecked Sendable {
         let step = sqlite3_backup_step(backup, -1)
         let finish = sqlite3_backup_finish(backup)
         guard step == SQLITE_DONE, finish == SQLITE_OK else { return false }
-        try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination)
+        do { try FilePlatform.protect(destination) } catch { return false }
         completed = true
         return true
     }
@@ -2617,8 +2641,7 @@ final class Database: @unchecked Sendable {
         let parent = URL(fileURLWithPath: destination).deletingLastPathComponent()
         let workspace = parent.appendingPathComponent(".tm-export-\(UUID().uuidString)")
         do {
-            try fm.createDirectory(at: workspace, withIntermediateDirectories: true,
-                                   attributes: [.posixPermissions: 0o700])
+            try FilePlatform.createPrivateDirectory(workspace)
         } catch { return false }
         defer { try? fm.removeItem(at: workspace) }
         let raw = workspace.appendingPathComponent("raw.db").path
@@ -2637,12 +2660,12 @@ final class Database: @unchecked Sendable {
         defer { sqlite3_finalize(statement) }
         sqlite3_bind_text(statement, 1, (compact as NSString).utf8String, -1, SQLITE_TRANSIENT)
         guard sqlite3_step(statement) == SQLITE_DONE else { return false }
-        do { try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: compact) }
+        do { try FilePlatform.protect(compact) }
         catch { return false }
         guard DataMaintenance.isSafeExportDestination(URL(fileURLWithPath: destination), databasePath: dbPath) else {
             return false
         }
-        return Darwin.rename(compact, destination) == 0
+        return FilePlatform.replace(compact, destination)
     }
 
     func restore(from source: String, beforeReplace: (() -> String?)? = nil) -> Bool {
@@ -2651,8 +2674,7 @@ final class Database: @unchecked Sendable {
         let fm = FileManager.default
         let workspace = fm.temporaryDirectory.appendingPathComponent("tm-restore-\(UUID().uuidString)")
         do {
-            try fm.createDirectory(at: workspace, withIntermediateDirectories: true,
-                                   attributes: [.posixPermissions: 0o700])
+            try FilePlatform.createPrivateDirectory(workspace)
         } catch { return false }
         defer { try? fm.removeItem(at: workspace) }
         let candidatePath = workspace.appendingPathComponent("candidate.db").path
@@ -2756,8 +2778,7 @@ final class Database: @unchecked Sendable {
         }
         defer { sqlite3_close(origin) }
         guard sqlite3_exec(origin, "PRAGMA query_only=ON;", nil, nil, nil) == SQLITE_OK else { return false }
-        guard FileManager.default.createFile(atPath: destination, contents: nil,
-                                             attributes: [.posixPermissions: 0o600]) else { return false }
+        guard FilePlatform.reservePrivateFile(destination) else { return false }
         var target: OpaquePointer?
         guard sqlite3_open_v2(destination, &target, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK else {
             if let target { sqlite3_close(target) }
@@ -2901,7 +2922,7 @@ final class Database: @unchecked Sendable {
             || '|' || (SELECT COUNT(*) || ':' || COALESCE(MAX(ts),0) FROM claude_quota_samples)
             || '|' || (SELECT COALESCE(MAX(CAST(v AS INTEGER)),0) FROM settings WHERE k='last_scan_heartbeat')
             || '|' || (SELECT COALESCE(MAX(CAST(v AS INTEGER)),0) FROM settings WHERE k='data_version')
-            || '|' || (SELECT strftime('%Y%m%d', 'now', 'localtime'));
+            || '|' || strftime('%Y%m%d','now','localtime');
         """
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return "err" }
         var out = "err"

@@ -1,4 +1,7 @@
 import Foundation
+#if os(Windows)
+import ucrt
+#endif
 
 /// DeepSeek Harness parser.
 ///
@@ -432,7 +435,11 @@ enum DSHParser {
             let amount = Int(min(UInt64(64 * 1024), end - readPosition))
             let chunk: Data?
             do {
+                #if os(macOS)
                 chunk = try autoreleasepool { try handle.read(upToCount: amount) }
+                #else
+                chunk = try handle.read(upToCount: amount)
+                #endif
             } catch {
                 return (nil, true)
             }
@@ -465,9 +472,13 @@ enum DSHParser {
         while remaining > 0 {
             let chunk: Data?
             do {
+                #if os(macOS)
                 chunk = try autoreleasepool {
                     try handle.read(upToCount: Int(min(UInt64(64 * 1024), remaining)))
                 }
+                #else
+                chunk = try handle.read(upToCount: Int(min(UInt64(64 * 1024), remaining)))
+                #endif
             } catch {
                 return (nil, true)
             }
@@ -490,15 +501,21 @@ enum DSHParser {
             let newline = data[lineStart..<data.endIndex].firstIndex(of: 0x0a)
             let lineEnd = newline ?? data.endIndex
             let line = data[lineStart..<lineEnd]
-            var parsed = false
-            autoreleasepool {
-                if let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any] {
-                    let byteOffset = data.distance(from: data.startIndex, to: lineStart)
-                    body((offset: baseOffset + Int64(byteOffset), obj: obj))
-                    count += 1
-                    parsed = true
+            func parseLine() -> Bool {
+                guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
+                    return false
                 }
+                let byteOffset = data.distance(from: data.startIndex, to: lineStart)
+                body((offset: baseOffset + Int64(byteOffset), obj: obj))
+                count += 1
+                return true
             }
+            let parsed: Bool
+            #if os(macOS)
+            parsed = autoreleasepool { parseLine() }
+            #else
+            parsed = parseLine()
+            #endif
             if !parsed && newline == nil { break }
             lineStart = newline.map { data.index(after: $0) } ?? data.endIndex
         }

@@ -1,6 +1,17 @@
 import Foundation
+#if os(macOS)
 import Combine
+#else
+import SwiftCrossUI
+#endif
+#if canImport(CryptoKit)
 import CryptoKit
+#else
+import Crypto
+#endif
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 /// Remote usage collector: pulls the usage feed exported by the VPS
 /// (cron exporter over a user-configured HTTPS or private-network feed)

@@ -1,5 +1,8 @@
 import XCTest
 import SQLite3
+#if os(Windows)
+import ucrt
+#endif
 @testable import ToastMonitor
 
 final class OpenCodeInitialUsageTests: XCTestCase {
@@ -12,7 +15,11 @@ final class OpenCodeInitialUsageTests: XCTestCase {
         try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
         database = Database.testInstance(path: directory + "/monitor.db")
         previousHome = ProcessInfo.processInfo.environment["OPENCODE_HOME"]
+        #if os(Windows)
+        _ = _putenv_s("OPENCODE_HOME", directory)
+        #else
         setenv("OPENCODE_HOME", directory, 1)
+        #endif
         execute("""
           CREATE TABLE session(id TEXT PRIMARY KEY, title TEXT, directory TEXT, model TEXT, cost REAL,
             tokens_input INTEGER, tokens_output INTEGER, tokens_reasoning INTEGER,
@@ -21,7 +28,15 @@ final class OpenCodeInitialUsageTests: XCTestCase {
     }
 
     override func tearDown() {
+        #if os(Windows)
+        if let previousHome {
+            _ = _putenv_s("OPENCODE_HOME", previousHome)
+        } else {
+            _ = _putenv_s("OPENCODE_HOME", "")
+        }
+        #else
         if let previousHome { setenv("OPENCODE_HOME", previousHome, 1) } else { unsetenv("OPENCODE_HOME") }
+        #endif
         database.close()
         try? FileManager.default.removeItem(atPath: directory)
         super.tearDown()

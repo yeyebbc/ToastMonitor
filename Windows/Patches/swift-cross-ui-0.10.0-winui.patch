@@ -1,0 +1,102 @@
+# swift-cross-ui 0.10.0 WinUI corrections: STA activation and DPI-aware text sizing.
+# Foreground permission is granted to the receiver; only its activation handler chooses presentation.
+# Measure text in its window's DPI context and ceil fractional desired sizes to integer allocations.
+--- a/Sources/WinUIBackend/WinUIBackend.swift
++++ b/Sources/WinUIBackend/WinUIBackend.swift
+@@ -63,24 +63,31 @@
+         _ args: AppActivationArguments,
+         to keyInstance: AppInstance
+     ) -> Never {
+-        let semaphore = DispatchSemaphore(value: 0)
+-        let promise = try! keyInstance.redirectActivationToAsync(args)!
+-        promise.completed = { _, _ in
+-            semaphore.signal()
+-        }
+-
+-        semaphore.wait()
+-
+-        // Bring key instance to the foreground
++        // The receiving application owns presentation; granting permission is not activation.
++        if !AllowSetForegroundWindow(keyInstance.processId) {
++            let error = GetLastError()
++            print("Could not grant foreground permission to the receiving instance (Windows error \(error))")
++        }
+         do {
+-            try InstancingHelpers.activateProcess(withId: Int(keyInstance.processId))
++            guard let completion = CreateEventW(nil, true, false, nil) else {
++                throw NSError(domain: "Win32", code: Int(GetLastError()))
++            }
++            defer { CloseHandle(completion) }
++            guard let promise = try keyInstance.redirectActivationToAsync(args) else {
++                throw NSError(domain: "SwiftCrossUI.Activation", code: 1, userInfo: [NSLocalizedDescriptionKey: "Activation redirection did not return an async action."])
++            }
++            promise.completed = { _, _ in
++                guard SetEvent(completion) else { let error = GetLastError(); fputs("Activation completion could not be signaled (Windows error \(error)).\n", stderr); Foundation.exit(1) }
++            }
++            // STA completion callbacks require apartment/message dispatch while waiting.
++            var handle: HANDLE? = completion
++            var index: DWORD = 0
++            let flags = DWORD(COWAIT_DISPATCH_CALLS.rawValue | COWAIT_DISPATCH_WINDOW_MESSAGES.rawValue)
++            try CHECKED(CoWaitForMultipleHandles(flags, INFINITE, 1, &handle, &index))
++            try promise.getResults()
+         } catch {
+-            print(
+-                """
+-                Failed to bring key instance (pid=\(keyInstance.processId)) to \
+-                foreground: \(error.localizedDescription)
+-                """
+-            )
++            print("Failed to redirect activation: \(error)")
++            Foundation.exit(1)
+         }
+         Foundation.exit(0)
+     }
+@@ -879,12 +886,27 @@
+         proposedHeight: Int?,
+         environment: EnvironmentValues
+     ) -> SIMD2<Int> {
++        // A XamlRoot cannot be reassigned. Keep each bound helper with its window;
++        // unparented widgets continue to use the original detached helper.
++        let textBlock: TextBlock
++        if let root = widget.xamlRoot,
++           let window = windows.first(where: { $0.grid.xamlRoot == root }) {
++            if let cached = window.measurementTextBlock {
++                textBlock = cached
++            } else {
++                textBlock = createTextView() as! TextBlock
++                textBlock.xamlRoot = root
++                window.measurementTextBlock = textBlock
++            }
++        } else {
++            textBlock = measurementTextBlock
++        }
+         // Update the text view's environment and measure its desired line height
+-        updateTextView(measurementTextBlock, content: text, environment: environment)
++        updateTextView(textBlock, content: text, environment: environment)
+ 
+         // Measure the text's size
+         var size = Self.measure(
+-            measurementTextBlock,
++            textBlock,
+             proposedWidth: proposedWidth,
+             proposedHeight: proposedHeight
+         )
+@@ -921,8 +943,8 @@
+ 
+         let computedSize = textBlock.desiredSize
+         return SIMD2(
+-            Int(computedSize.width),
+-            Int(computedSize.height)
++            Int(computedSize.width.rounded(.up)),
++            Int(computedSize.height.rounded(.up))
+         )
+     }
+ 
+@@ -2323,6 +2345,7 @@
+     var child: WinUIBackend.Widget?
+     var grid: WinUI.Grid
+     var cachedAppWindow: WinAppSDK.AppWindow!
++    fileprivate var measurementTextBlock: TextBlock?
+     var isActive = false
+     var currentAlert: WinUIBackend.Alert?
+ 

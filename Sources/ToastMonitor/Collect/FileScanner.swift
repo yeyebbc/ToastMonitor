@@ -1,13 +1,23 @@
 import Foundation
-import Darwin
+#if os(macOS)
+import CoreFoundation
+#endif
 
 /// Incremental JSONL utilities: tracks byte offsets so we only parse appended data.
 enum FileScanner {
+    #if os(Windows)
+    private static let trueNumber = NSNumber(value: true)
+    private static let falseNumber = NSNumber(value: false)
+    #endif
     /// Reject malformed counters before arithmetic, rather than after constructing a turn.
     static func tokenCount(_ value: Any?) -> Int64 {
-        guard let number = value as? NSNumber,
-              CFGetTypeID(number) != CFBooleanGetTypeID(),
-              !["f", "d"].contains(String(cString: number.objCType)),
+        guard let number = value as? NSNumber else { return 0 }
+        #if os(Windows)
+        guard number !== trueNumber, number !== falseNumber else { return 0 }
+        #else
+        guard CFGetTypeID(number) != CFBooleanGetTypeID() else { return 0 }
+        #endif
+        guard !["f", "d"].contains(String(cString: number.objCType)),
               number.compare(NSNumber(value: 0)) != .orderedAscending,
               number.compare(NSNumber(value: TurnRecord.maxTokens)) != .orderedDescending else { return 0 }
         return number.int64Value
@@ -37,17 +47,12 @@ enum FileScanner {
     }
 
     static func fileStat(_ path: String) -> Stat? {
-        var st = stat()
-        guard stat(path, &st) == 0 else { return nil }
-        let mtime = Int64(st.st_mtimespec.tv_sec) * 1_000_000_000 + Int64(st.st_mtimespec.tv_nsec)
-        return Stat(size: st.st_size, mtime: mtime, identity: Int64(st.st_ino))
+        FilePlatform.fileStat(path)
     }
 
     /// Directory mtime (changes when entries are added/removed).
     static func dirMT(_ path: String) -> Int64? {
-        var st = stat()
-        guard stat(path, &st) == 0 else { return nil }
-        return Int64(st.st_mtimespec.tv_sec) * 1_000_000_000 + Int64(st.st_mtimespec.tv_nsec)
+        FilePlatform.fileStat(path)?.mtime
     }
 
     /// Lists JSONL files while reusing a traversal until any visited
@@ -100,12 +105,19 @@ enum FileScanner {
     /// >= the cursor — an in-place rewrite is otherwise invisible.
 
     /// Only the current line is retained, so large initial scans do not
-    /// duplicate the entire suffix. Each synchronous callback has its own
-    /// autorelease pool: Foundation's JSON objects and callback temporaries
-    /// must not accumulate for the lifetime of a collector queue work item.
+    /// duplicate the entire suffix. On macOS, each synchronous callback has
+    /// its own autorelease pool so Foundation objects and callback temporaries
+    /// do not accumulate for the lifetime of a collector queue work item.
     @discardableResult
     static func forEachNewJSONLine(path: String, fromOffset: Int64,
                                    _ body: ((offset: Int64, obj: [String: Any])) -> Void) -> Int64 {
+        func parseLine(_ line: Data, offset: Int64) -> Bool {
+            guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
+                return false
+            }
+            body((offset: offset, obj: obj))
+            return true
+        }
         guard let fh = FileHandle(forReadingAtPath: path) else { return fromOffset }
         defer { fh.closeFile() }
         let total = (try? fh.seekToEnd()) ?? 0
@@ -128,9 +140,13 @@ enum FileScanner {
         while true {
             let chunk: Data?
             do {
+                #if os(macOS)
                 // FileHandle can also autorelease its backing NSData. Keep
                 // the returned Data alive without retaining every old chunk.
                 chunk = try autoreleasepool { try fh.read(upToCount: 64 * 1024) }
+                #else
+                chunk = try fh.read(upToCount: 64 * 1024)
+                #endif
             } catch {
                 break
             }
@@ -139,14 +155,16 @@ enum FileScanner {
             var lineStart = 0
             var searchFrom = scanned
             while let newline = pending[searchFrom...].firstIndex(of: 0x0a) {
-                // Foundation parsing autoreleases per line; drain it here or a
-                // multi-GB scan keeps every line's temporaries alive.
+                #if os(macOS)
+                // Drain Foundation parsing and callback temporaries per line.
                 autoreleasepool {
-                    if let obj = try? JSONSerialization.jsonObject(
-                        with: pending[lineStart..<newline]) as? [String: Any] {
-                        body((offset: Int64(start + consumed) + Int64(lineStart), obj: obj))
-                    }
+                    _ = parseLine(pending[lineStart..<newline],
+                                  offset: Int64(start + consumed) + Int64(lineStart))
                 }
+                #else
+                _ = parseLine(pending[lineStart..<newline],
+                              offset: Int64(start + consumed) + Int64(lineStart))
+                #endif
                 lineStart = newline + 1
                 searchFrom = lineStart
             }
@@ -158,11 +176,16 @@ enum FileScanner {
             scanned = pending.count
         }
         if !pending.isEmpty {
-            autoreleasepool {
-                if let obj = try? JSONSerialization.jsonObject(with: pending) as? [String: Any] {
-                    body((offset: Int64(start + consumed), obj: obj))
-                    consumed += UInt64(pending.count)
-                }
+            let parsed: Bool
+            #if os(macOS)
+            parsed = autoreleasepool {
+                parseLine(pending, offset: Int64(start + consumed))
+            }
+            #else
+            parsed = parseLine(pending, offset: Int64(start + consumed))
+            #endif
+            if parsed {
+                consumed += UInt64(pending.count)
             }
         }
         // A final complete line without a newline is consumable; malformed

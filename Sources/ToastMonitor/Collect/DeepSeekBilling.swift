@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 /// Platform billing is an experimental, authenticated website API. It is not
 /// inferred from wallet deltas or local session logs.
@@ -79,8 +82,9 @@ enum DeepSeekBilling {
             let formatter = NumberFormatter()
             formatter.locale = Locale(identifier: "en_US_POSIX")
             formatter.numberStyle = .decimal
-            formatter.minimumFractionDigits = 2
-            formatter.maximumFractionDigits = 2
+            // Corelibs Foundation 6.1 skips maximumFractionDigits with a
+            // positive minimum; the ICU pattern enforces cents at display only.
+            formatter.positiveFormat = "#,##0.00"
             return "\(currency) \(formatter.string(from: NSDecimalNumber(decimal: amount)) ?? "-")"
         }
 

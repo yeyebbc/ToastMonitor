@@ -1,6 +1,15 @@
+#if canImport(CryptoKit)
 import CryptoKit
+#else
+import Crypto
+#endif
+#if os(macOS)
 import Darwin
+#endif
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 /// Verifies signed update metadata without downloading or executing an update.
 /// The caller supplies the HTTPS endpoint and the public key shipped by the
@@ -14,6 +23,15 @@ enum UpdateChecker {
         case x86_64
 
         static var current: Self {
+            #if os(Windows)
+            #if arch(x86_64)
+            return .x86_64
+            #elseif arch(arm64)
+            return .arm64
+            #else
+            #error("Unsupported Windows update architecture")
+            #endif
+            #else
             var systemInfo = utsname()
             uname(&systemInfo)
             let capacity = MemoryLayout.size(ofValue: systemInfo.machine)
@@ -23,6 +41,7 @@ enum UpdateChecker {
                 }
             }
             return from(machine: machine)
+            #endif
         }
 
         static func from(machine: String) -> Self {
@@ -203,7 +222,9 @@ enum UpdateChecker {
         request.cachePolicy = .reloadIgnoringLocalCacheData
         let delegate = HTTPSRedirectDelegate(maxBytes: artifactLimit)
         let configuration = URLSessionConfiguration.ephemeral
+        #if os(macOS)
         configuration.waitsForConnectivity = false
+        #endif
         configuration.timeoutIntervalForRequest = boundedTimeout
         // The resource timeout bounds the whole download, not a single
         // request: a ~100 MB zip over a slow link takes minutes. Keep the
@@ -252,7 +273,9 @@ enum UpdateChecker {
         request.cachePolicy = .reloadIgnoringLocalCacheData
         let delegate = HTTPSRedirectDelegate(maxBytes: Int64(limit))
         let configuration = URLSessionConfiguration.ephemeral
+        #if os(macOS)
         configuration.waitsForConnectivity = false
+        #endif
         configuration.timeoutIntervalForRequest = boundedTimeout
         configuration.timeoutIntervalForResource = boundedTimeout
         let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
