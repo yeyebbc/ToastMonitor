@@ -234,6 +234,22 @@ final class NetworkBoundaryTests: XCTestCase {
                        "locally-configured tools must not import remote rows")
         XCTAssertNil(db.setting("remote_watermark_codex"),
                      "no watermark is written for a skipped tool")
+
+        let sharedURL = "https://shared.example.test/usage.json"
+        let codexURL = "https://codex.example.test/usage.json"
+        let remote = HermesRemoteClient.shared
+        XCTAssertTrue(db.setSetting("remote_feed_url", sharedURL))
+        XCTAssertTrue(ToolKind.codex.setSources(.both, in: db))
+        XCTAssertTrue(remote.provision(url: codexURL, for: .codex, in: db))
+        XCTAssertEqual(remote.feedURL(for: .claude, in: db), sharedURL)
+        remote.importFeed(["rows": rows], from: sharedURL, database: db)
+        XCTAssertNil(db.setting("remote_watermark_codex"))
+
+        remote.importFeed(["rows": rows], from: codexURL, database: db)
+        XCTAssertEqual(db.turns(sessionTool: "codex", sessionID: "s-local").count, 1)
+        XCTAssertTrue(remote.provision(url: "", for: .codex, in: db))
+        XCTAssertEqual(remote.feedURL(for: .codex, in: db), "")
+        XCTAssertEqual(remote.feedURL(for: .claude, in: db), sharedURL)
     }
 }
 

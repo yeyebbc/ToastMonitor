@@ -20,7 +20,8 @@ final class DatabaseExportTests: XCTestCase {
     }
 
     func testExportRemovesLegacySecretsButPreservesLiveRecoveryCopies() throws {
-        let keys = ["or_keys", "openrouter_key", "go_auth_cookie", "go_workspace_id"]
+        let keys = ["or_keys", "openrouter_key", "go_auth_cookie", "go_workspace_id",
+                    "remote_feed_url", "remote_feed_url_hermes"]
         for key in keys { XCTAssertTrue(database.setSetting(key, "fake-secret-\(key)-only-test")) }
         let target = directory + "/export.db"
         XCTAssertTrue(DataMaintenance.exportDatabase(to: target, database: database))

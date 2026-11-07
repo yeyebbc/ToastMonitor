@@ -22,7 +22,9 @@ final class HermesSourceSwitchTests: XCTestCase {
         super.tearDown()
     }
 
-    private func local(_ input: Int64, reasoning: Int64 = 0, write: Int64 = 0) throws {
+    private func local(_ input: Int64, reasoning: Int64 = 0, write: Int64 = 0,
+                       sources: UsageSources = .local) throws {
+        XCTAssertTrue(ToolKind.hermes.setSources(sources, in: database))
         var handle: OpaquePointer?
         XCTAssertEqual(sqlite3_open(directory + "/state.db", &handle), SQLITE_OK)
         defer { sqlite3_close(handle) }
@@ -41,8 +43,8 @@ final class HermesSourceSwitchTests: XCTestCase {
         XCTAssertTrue(result.committed)
     }
 
-    private func remote(_ counts: [Int64]) {
-        XCTAssertTrue(database.setSetting("src_hermes", "remote"))
+    private func remote(_ counts: [Int64], sources: UsageSources = .remote) {
+        XCTAssertTrue(ToolKind.hermes.setSources(sources, in: database))
         let now = Int64(Date().timeIntervalSince1970)
         let rows: [[String: Any]] = counts.map { count in
             ["tool": "hermes", "session_id": "switch", "model": "model",
@@ -69,6 +71,16 @@ final class HermesSourceSwitchTests: XCTestCase {
         try local(150)
         remote([150])
         XCTAssertEqual(inputTotal, 150)
+    }
+
+    func testBothSourcesCanCollectWithoutReplayingSharedTotals() throws {
+        try local(100, sources: .both)
+        remote([150], sources: .both)
+        try local(175, sources: .both)
+        remote([175], sources: .both)
+        try local(190, sources: .off)
+        remote([200], sources: .off)
+        XCTAssertEqual(inputTotal, 175)
     }
 
     func testRollbackRegrowAndDuplicateFeedRowsDoNotReplayHistory() throws {

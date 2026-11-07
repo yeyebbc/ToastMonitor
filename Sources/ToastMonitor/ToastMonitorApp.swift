@@ -273,7 +273,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 exit(1)
             }
             Database.shared.open()
-            if HermesRemoteClient.shared.provision(url: args[flag + 1]) {
+            if HermesRemoteClient.shared.provision(url: args[flag + 1], for: .hermes) {
                 print("hermes provisioned")
                 exit(0)
             }

@@ -2,32 +2,16 @@ import SwiftUI
 
 /// Settings › Sources › Collectors: one summary row, collapsed by default.
 /// Testing, rescanning or the disclosure triangle expands a table with one
-/// row per collector plus the remote feed.
+/// row per enabled source.
 struct CollectorStatusSection: View {
     @ObservedObject private var health = SourceHealthHub.shared
-    @ObservedObject private var remote = HermesRemoteClient.shared
-    /// Effective source per tool, owned by the Sources pane.
-    let remoteSources: [ToolKind: Bool]
+    let sources: [ToolKind: UsageSources]
 
     @State private var expanded = false
     @State private var testing = false
     @State private var testResult: (text: String, ok: Bool)?
     /// Bumped per test start; a stale 10s timeout checks it before firing.
     @State private var testGeneration = 0
-
-    private struct Row: Identifiable {
-        let id: String
-        let name: String
-        let symbol: String
-        let color: Color
-        let mode: String
-        let status: Status
-        let lastScan: Int64
-        let imported: String
-        let failed: String
-        let duration: String
-        let error: String?
-    }
 
     enum Status: String {
         case synced = "Synced", stale = "Stale", error = "Error", idle = "Idle"
@@ -60,7 +44,7 @@ struct CollectorStatusSection: View {
                 }
                 table
                 ForEach(rows.filter { $0.error != nil }) { row in
-                    LabeledContent(row.name) {
+                    LabeledContent(row.displayName) {
                         Text(row.error ?? "")
                             .foregroundStyle(TMDesign.danger)
                             .textSelection(.enabled)
@@ -96,16 +80,18 @@ struct CollectorStatusSection: View {
         return Table(rows) {
             TableColumn("Source") { row in
                 HStack(spacing: 6) {
-                    Image(systemName: row.symbol)
-                        .foregroundStyle(row.color)
+                    let tool = ToolKind(rawValue: row.tool)
+                    Image(systemName: row.mode == "remote" ? "externaldrive.badge.icloud" : (tool?.symbol ?? "tray"))
+                        .foregroundStyle(tool?.color ?? TMDesign.accent)
                         .frame(width: 16)
-                    Text(row.name)
+                    Text(row.displayName)
                 }
             }
             .width(min: 96, ideal: 128)
             TableColumn("Status") { row in
-                Label(row.status.rawValue, systemImage: row.status.symbol)
-                    .foregroundStyle(row.status.color)
+                let status = status(for: row)
+                Label(status.rawValue, systemImage: status.symbol)
+                    .foregroundStyle(status.color)
             }
             .width(min: 56, ideal: 64)
             TableColumn("Last Scan") { row in
@@ -113,15 +99,15 @@ struct CollectorStatusSection: View {
             }
             .width(min: 72, ideal: 78)
             TableColumn("Imported") { row in
-                Text(row.imported).frame(maxWidth: .infinity, alignment: .trailing)
+                Text(row.lastScan > 0 ? "\(row.lastRows)" : "—").frame(maxWidth: .infinity, alignment: .trailing)
             }
             .width(min: 44, ideal: 56)
             TableColumn("Failed") { row in
-                Text(row.failed).frame(maxWidth: .infinity, alignment: .trailing)
+                Text(row.lastScan > 0 ? "\(row.failedRows)" : "—").frame(maxWidth: .infinity, alignment: .trailing)
             }
             .width(min: 36, ideal: 42)
             TableColumn("Time") { row in
-                Text(row.duration).frame(maxWidth: .infinity, alignment: .trailing)
+                Text(row.lastScan > 0 && row.mode == "local" ? String(format: "%.0f ms", row.durationMs) : "—").frame(maxWidth: .infinity, alignment: .trailing)
             }
             .width(min: 40, ideal: 48)
         }
@@ -131,52 +117,31 @@ struct CollectorStatusSection: View {
         .accessibilityLabel("Collector status")
     }
 
-    private var rows: [Row] {
-        let tools = ToolKind.allCases.filter { $0 != .openrouter }
-        var out = tools.map { tool -> Row in
-            let h = health.sources.first { $0.tool == tool.rawValue }
-            let status: Status
-            if h?.error != nil {
-                status = .error
-            } else if h?.isStale == true {
-                status = .stale
-            } else if (h?.lastScan ?? 0) > 0 {
-                status = .synced
-            } else {
-                status = .idle
+    private var rows: [SourceHealth] {
+        ToolKind.allCases.filter { $0 != .openrouter }.flatMap { tool -> [SourceHealth] in
+            let enabled = sources[tool] ?? .local
+            let modes = [(enabled.includesLocal, "local"), (enabled.includesRemote, "remote")]
+            return modes.compactMap { included, mode in
+                guard included else { return nil }
+                return health.sources.first { $0.tool == tool.rawValue && $0.mode == mode }
+                    ?? SourceHealth(tool: tool.rawValue, mode: mode)
             }
-            return Row(id: tool.rawValue, name: tool.displayName, symbol: tool.symbol, color: tool.color,
-                       mode: (remoteSources[tool] ?? false) ? "Remote" : "Local",
-                       status: status, lastScan: h?.lastScan ?? 0,
-                       imported: h.map { "\($0.lastRows)" } ?? "—",
-                       failed: h.map { "\($0.failedRows)" } ?? "—",
-                       duration: h.map { String(format: "%.0f ms", $0.durationMs) } ?? "—",
-                       error: h?.error)
         }
-        let st = remote.status
-        let remoteStatus: Status
-        if st.error != nil {
-            remoteStatus = .error
-        } else if st.lastSync > 0,
-                  Date().timeIntervalSince1970 - TimeInterval(st.lastSync) > SourceHealth.staleThreshold {
-            remoteStatus = .stale
-        } else {
-            remoteStatus = st.lastSync > 0 ? .synced : .idle
-        }
-        out.append(Row(id: "remote-feed", name: "Remote Feed", symbol: "externaldrive.badge.icloud",
-                       color: TMDesign.accent, mode: "Remote", status: remoteStatus,
-                       lastScan: st.lastSync, imported: "\(st.lastRows)", failed: "—",
-                       duration: "—", error: st.error))
-        return out
+    }
+
+    private func status(for row: SourceHealth) -> Status {
+        if row.error != nil { return .error }
+        if row.isStale { return .stale }
+        return row.lastScan > 0 ? .synced : .idle
     }
 
     private var summary: String {
         let rows = rows
-        let errors = rows.filter { $0.status == .error }
-        let stale = rows.filter { $0.status == .stale }
-        if errors.count == 1 { return "\(errors[0].name) failed" }
+        let errors = rows.filter { $0.error != nil }
+        let stale = rows.filter { $0.error == nil && $0.isStale }
+        if errors.count == 1 { return "\(errors[0].displayName) failed" }
         if errors.count > 1 { return "\(errors.count) sources failed" }
-        if stale.count == 1 { return "\(stale[0].name) is stale" }
+        if stale.count == 1 { return "\(stale[0].displayName) is stale" }
         if stale.count > 1 { return "\(stale.count) sources are stale" }
         let last = rows.map(\.lastScan).max() ?? 0
         return last > 0 ? "Up to date · \(Format.dateTime(last))" : "Not scanned yet"
@@ -184,8 +149,8 @@ struct CollectorStatusSection: View {
 
     private var summaryColor: Color {
         let rows = rows
-        if rows.contains(where: { $0.status == .error }) { return TMDesign.danger }
-        if rows.contains(where: { $0.status == .stale }) { return TMDesign.warning }
+        if rows.contains(where: { $0.error != nil }) { return TMDesign.danger }
+        if rows.contains(where: { $0.error == nil && $0.isStale }) { return TMDesign.warning }
         return .secondary
     }
 
@@ -206,13 +171,14 @@ struct CollectorStatusSection: View {
             HermesRemoteClient.shared.poll {
                 guard gen == testGeneration else { return }
                 testing = false
-                let remoteErr = HermesRemoteClient.shared.status.error
-                if receipt.failedSources.isEmpty && remoteErr == nil {
+                let remoteErrors = rows.filter { $0.mode == "remote" && $0.error != nil }
+                let failures = receipt.failedSources + remoteErrors.map { row in
+                    "\(row.displayName): \(row.error ?? "")"
+                }
+                if failures.isEmpty {
                     testResult = ("Scan complete · \(receipt.turns) new", true)
                 } else {
-                    var parts = receipt.failedSources
-                    if let remoteErr { parts.append("Remote Feed: \(remoteErr)") }
-                    testResult = ("Failed: \(parts.joined(separator: ", "))", false)
+                    testResult = ("Failed: \(failures.joined(separator: ", "))", false)
                 }
             }
         }

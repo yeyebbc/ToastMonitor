@@ -2630,7 +2630,11 @@ final class Database: @unchecked Sendable {
             return false
         }
         defer { sqlite3_close(handle) }
-        guard sqlite3_exec(handle, "DELETE FROM settings WHERE k IN ('or_keys','openrouter_key','go_auth_cookie','go_workspace_id','remote_feed_url');",
+        guard sqlite3_exec(handle, """
+                           DELETE FROM settings
+                           WHERE k IN ('or_keys','openrouter_key','go_auth_cookie','go_workspace_id','remote_feed_url')
+                              OR k GLOB 'remote_feed_url_*';
+                           """,
                            nil, nil, nil) == SQLITE_OK else { return false }
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(handle, "VACUUM INTO ?;", -1, &statement, nil) == SQLITE_OK else { return false }

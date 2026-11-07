@@ -1,8 +1,5 @@
 import SwiftUI
 
-/// Settings › Sources: where each tool's usage comes from (this Mac or the
-/// remote feed) and collector status. Quota/balance accounts and fixed
-/// subscriptions have their own Accounts pane.
 struct AccountsSettingsPane: View {
     var body: some View {
         AccountsSettingsSection()
@@ -10,203 +7,170 @@ struct AccountsSettingsPane: View {
     }
 }
 
+/// Settings › Sources: each tool's usage inputs and collector status.
 struct SourcesSettingsPane: View {
-    /// Observed so the feed status row updates when a poll completes.
-    @ObservedObject private var remote = HermesRemoteClient.shared
-    @State private var feedURL = ""
-    @State private var sources: [ToolKind: Bool] = [:] // tool -> isRemote (draft)
-    /// Effective sources, loaded on appear and updated on change. Reading
-    /// tool.sourceIsRemote in body would hit the DB per tool per render.
-    @State private var effectiveSources: [ToolKind: Bool] = [:]
-    @State private var saved = false
-    @State private var feedError: String?
-    @State private var feedDisabled = false
-    /// Per-tool feedback slots: each tool owns its own "Saved ✓"/"Save
-    /// failed" message, so one tool's save never clears another's feedback.
-    @State private var sourceSaved: [ToolKind: Bool] = [:]
-    @State private var sourceFailed: [ToolKind: Bool] = [:]
-    /// Per-tool write generation: only the latest write for a tool may touch
-    /// the saved/failed feedback, so rapid toggles cannot interleave.
-    @State private var sourceGeneration: [ToolKind: Int] = [:]
+    @State private var sources: [ToolKind: UsageSources] = [:]
+    @State private var sourceSaves: [ToolKind: (id: UUID, saved: Bool?)] = [:]
 
     private let tools = ToolKind.allCases.filter { $0 != .openrouter }
 
     var body: some View {
-        dataSourcesSection
-            .onAppear {
-                feedURL = remote.feedURL
-                for t in tools {
-                    sources[t] = t.sourceIsRemote
-                    effectiveSources[t] = t.sourceIsRemote
-                }
-            }
-
-        remoteFeedSection
-            .onChange(of: feedURL) { _ in
-                saved = false
-                feedError = nil
-                feedDisabled = false
-            }
-
-        CollectorStatusSection(remoteSources: effectiveSources)
-    }
-
-    private var dataSourcesSection: some View {
         Section("Data Sources") {
             ForEach(tools) { tool in
-                if tool.supportsRemoteSource {
+                VStack(alignment: .leading, spacing: 8) {
                     LabeledContent {
-                        Picker("\(tool.displayName) source", selection: sourceBinding(for: tool)) {
-                            Text("Local").tag(false)
-                            Text("Remote").tag(true)
+                        if tool.supportsRemoteSource {
+                            HStack(spacing: 12) {
+                                Toggle("Local", isOn: sourceBinding(for: tool, remote: false))
+                                    .accessibilityLabel("\(tool.displayName) Local")
+                                Toggle("Remote", isOn: sourceBinding(for: tool, remote: true))
+                                    .accessibilityLabel("\(tool.displayName) Remote")
+                            }
+                            .toggleStyle(.checkbox)
+                            .disabled(sourceSaves[tool] != nil && sourceSaves[tool]?.saved == nil)
+                        } else {
+                            Text("Local only")
                         }
-                        .pickerStyle(.radioGroup)
-                        .horizontalRadioGroupLayout()
-                        .labelsHidden()
                     } label: {
                         sourceLabel(tool)
                     }
-                } else {
-                    LabeledContent {
-                        Text("Local only")
-                    } label: {
-                        sourceLabel(tool)
+                    if sources[tool]?.includesRemote == true {
+                        RemoteFeedSettingsRow(tool: tool)
                     }
                 }
             }
         }
+        .onAppear {
+            sources = Dictionary(uniqueKeysWithValues: tools.map { ($0, $0.sources()) })
+        }
+
+        CollectorStatusSection(sources: sources)
     }
 
-    /// Tool icon and name, followed by the per-tool save feedback.
     private func sourceLabel(_ tool: ToolKind) -> some View {
         HStack(spacing: 8) {
             Image(systemName: tool.symbol)
                 .foregroundStyle(tool.color)
                 .frame(width: 18)
             Text(tool.displayName)
-            if sourceSaved[tool] == true {
-                Image(systemName: "checkmark")
-                    .foregroundStyle(TMDesign.accent)
-                    .accessibilityLabel("Saved")
-            } else if sourceFailed[tool] == true {
-                Image(systemName: "exclamationmark.triangle")
-                    .foregroundStyle(TMDesign.danger)
-                    .accessibilityLabel("Save failed")
+            if let saved = sourceSaves[tool]?.saved {
+                Image(systemName: saved ? "checkmark" : "exclamationmark.triangle")
+                    .foregroundStyle(saved ? TMDesign.accent : TMDesign.danger)
+                    .accessibilityLabel(saved ? "Saved" : "Save failed")
             }
         }
     }
 
-    private var remoteFeedSection: some View {
-        Section {
-            HStack {
-                TextField("Feed URL", text: $feedURL, prompt: Text("HTTPS or private range"))
-                Button("Save") {
-                    let raw = feedURL.trimmingCharacters(in: .whitespacesAndNewlines)
-                    saved = false
-                    // Validate locally first so the failure reason can
-                    // be specific instead of a single generic message.
-                    if let problem = Self.feedURLProblem(raw) {
-                        feedError = problem
-                        return
-                    }
-                    DispatchQueue.global(qos: .userInitiated).async {
-                        let ok = HermesRemoteClient.shared.provision(url: raw.isEmpty ? nil : raw)
-                        DispatchQueue.main.async {
-                            saved = ok
-                            feedError = ok ? nil : "Save failed (database unavailable)"
-                            feedDisabled = ok && raw.isEmpty
-                        }
-                    }
-                }
-                Button {
-                    HermesRemoteClient.shared.maybePoll()
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                }
-                .help("Pull now")
-                .accessibilityLabel("Pull now")
-            }
-        } header: {
-            Text("Remote Feed")
-        } footer: {
-            remoteFeedStatus
-        }
-    }
-
-    @ViewBuilder
-    private var remoteFeedStatus: some View {
-        let st = remote.status
-        if st.lastSync > 0 || st.error != nil || feedDisabled || saved || feedError != nil {
-            HStack {
-                if st.lastSync > 0 {
-                    Text(st.lastRows > 0
-                         ? "Synced \(Format.dateTime(st.lastSync)) · \(st.lastRows) new"
-                         : "Synced \(Format.dateTime(st.lastSync)) · up to date")
-                }
-                if let err = st.error {
-                    Text(err).foregroundStyle(TMDesign.danger)
-                }
-                if feedDisabled {
-                    Text("Remote feed disabled").foregroundStyle(TMDesign.accent)
-                } else if saved {
-                    Text("Saved").foregroundStyle(TMDesign.accent)
-                }
-                if let err = feedError {
-                    Text(err).foregroundStyle(TMDesign.danger)
-                }
-            }
-        }
-    }
-
-    private func sourceBinding(for tool: ToolKind) -> Binding<Bool> {
+    private func sourceBinding(for tool: ToolKind, remote: Bool) -> Binding<Bool> {
         Binding(
-            get: { sources[tool] ?? (tool.defaultSource == "remote") },
-            set: { newValue in
-                let generation = (sourceGeneration[tool] ?? 0) + 1
-                sourceGeneration[tool] = generation
+            get: {
+                let current = sources[tool] ?? .local
+                return remote ? current.includesRemote : current.includesLocal
+            },
+            set: { enabled in
+                if let save = sourceSaves[tool], save.saved == nil { return }
+                let current = sources[tool] ?? .local
+                let updated = UsageSources(local: remote ? current.includesLocal : enabled,
+                                           remote: remote ? enabled : current.includesRemote)
+                let id = UUID()
+                sourceSaves[tool] = (id, nil)
                 DispatchQueue.global(qos: .userInitiated).async {
-                    let ok = tool.setSource(remote: newValue)
+                    let ok = tool.setSources(updated)
                     DispatchQueue.main.async {
-                        guard sourceGeneration[tool] == generation else { return }
+                        sourceSaves[tool] = (id, ok)
                         if ok {
-                            sources[tool] = newValue
-                            effectiveSources[tool] = newValue
-                            sourceSaved[tool] = true
-                            sourceFailed[tool] = nil
-                        } else {
-                            let persisted = tool.sourceIsRemote
-                            sources[tool] = persisted
-                            effectiveSources[tool] = persisted
-                            sourceFailed[tool] = true
-                            sourceSaved[tool] = nil
+                            sources[tool] = updated
+                            if !updated.includesLocal {
+                                SourceHealthHub.shared.remove(tool: tool, mode: "local")
+                            }
+                            if !updated.includesRemote {
+                                SourceHealthHub.shared.remove(tool: tool, mode: "remote")
+                            }
+                            if updated.includesLocal && !current.includesLocal {
+                                CollectorEngine.shared.scheduleScan()
+                            }
+                            if updated.includesRemote && !current.includesRemote,
+                               !HermesRemoteClient.shared.feedURL(for: tool).isEmpty {
+                                HermesRemoteClient.shared.poll(tool: tool)
+                            }
                         }
                         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                            sourceSaved[tool] = nil
-                            sourceFailed[tool] = nil
+                            if sourceSaves[tool]?.id == id { sourceSaves[tool] = nil }
                         }
                     }
                 }
             }
         )
     }
+}
 
-    /// Local validation mirroring HermesRemoteClient.provision, so the Save
-    /// button can report the specific reason instead of a generic failure.
-    private static func feedURLProblem(_ raw: String) -> String? {
-        if raw.isEmpty { return nil }
-        if raw.count > HermesRemoteClient.maxFeedURLLength {
-            return "URL too long (max \(HermesRemoteClient.maxFeedURLLength) chars)"
+private struct RemoteFeedSettingsRow: View {
+    let tool: ToolKind
+
+    @ObservedObject private var health = SourceHealthHub.shared
+    @State private var feedURL = ""
+    @State private var saving = false
+    @State private var savedMessage: String?
+    @State private var feedError: String?
+
+    private let remote = HermesRemoteClient.shared
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                TextField("Feed URL", text: $feedURL, prompt: Text("HTTPS or private range"))
+                    .accessibilityLabel("\(tool.displayName) Feed URL")
+                    .disabled(saving)
+                Button("Save", action: save)
+                    .disabled(saving)
+                Button {
+                    remote.poll(tool: tool)
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .help("Pull now")
+                .accessibilityLabel("Pull \(tool.displayName) now")
+                .disabled(saving || remote.feedURL(for: tool).isEmpty)
+            }
+            if let status = health.sources.first(where: { $0.tool == tool.rawValue && $0.mode == "remote" }) {
+                if let error = status.error {
+                    Text(error).foregroundStyle(TMDesign.danger)
+                } else {
+                    Text(status.lastRows > 0
+                         ? "Synced \(Format.dateTime(status.lastScan)) · \(status.lastRows) new"
+                         : "Synced \(Format.dateTime(status.lastScan)) · up to date")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            if let savedMessage { Text(savedMessage).foregroundStyle(TMDesign.accent) }
+            if let feedError { Text(feedError).foregroundStyle(TMDesign.danger) }
         }
-        if raw.rangeOfCharacter(from: .controlCharacters) != nil {
-            return "URL contains control characters"
+        .onAppear { feedURL = remote.feedURL(for: tool) }
+        .onChange(of: feedURL) { _ in
+            savedMessage = nil
+            feedError = nil
         }
-        guard let url = URL(string: raw) else {
-            return "Not a valid URL"
+    }
+
+    private func save() {
+        let address = feedURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        savedMessage = nil
+        feedError = HermesRemoteClient.feedURLProblem(address)
+        guard feedError == nil else { return }
+        saving = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let ok = HermesRemoteClient.shared.provision(url: address, for: tool)
+            DispatchQueue.main.async {
+                saving = false
+                guard ok else {
+                    feedError = "Save failed (database unavailable)"
+                    return
+                }
+                savedMessage = address.isEmpty ? "Feed URL cleared" : "Saved"
+                SourceHealthHub.shared.remove(tool: tool, mode: "remote")
+                if !address.isEmpty { remote.poll(tool: tool) }
+            }
         }
-        guard HermesRemoteClient.isAllowedFeedURL(url) else {
-            return "URL rejected — HTTPS or private range only"
-        }
-        return nil
     }
 }
 

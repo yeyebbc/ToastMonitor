@@ -33,14 +33,14 @@ enum PerfCollector {
         // several runs so one tick never holds the collector for long.
         var budget: Int64 = 128 * 1024 * 1024
         func scan(_ tool: ToolKind, _ files: [String], _ scanner: (String) -> Int64) {
-            guard !tool.sourceIsRemote else { return }
+            guard tool.sources(in: database).includesLocal else { return }
             for file in files where budget > 0 { budget -= scanner(file) }
         }
         scan(.claude, claudeFiles) { scanClaude(file: $0, database: database) }
         scan(.codex, codexFiles) { scanCodex(file: $0, database: database) }
         scan(.omp, ompFiles) { scanOmp(file: $0, database: database) }
         scan(.dsh, DSHParser.listSessionFiles()) { scanDSH(file: $0, database: database) }
-        if !ToolKind.opencode.sourceIsRemote {
+        if ToolKind.opencode.sources(in: database).includesLocal {
             scanOpenCode(database: database)
         }
         let hourAgoMs = Int64(Date().timeIntervalSince1970 * 1000) - 3_600_000

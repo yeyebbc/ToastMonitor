@@ -1,10 +1,9 @@
 import Foundation
-import Combine
 import CryptoKit
 
 /// Remote usage collector: pulls the usage feed exported by the VPS
 /// (cron exporter over a user-configured HTTPS or private-network feed)
-/// and imports turns for every tool whose source is set to "remote".
+/// and imports turns for tools that have enabled that feed.
 ///
 /// Row semantics per tool (produced by tm-export.py):
 ///  - hermes:   aggregate per (session, model) — delta-tracked locally
@@ -14,7 +13,7 @@ import CryptoKit
 ///
 /// Event IDs provide idempotency; timestamp watermarks are retained only for
 /// diagnostics and never exclude a valid per-turn event.
-final class HermesRemoteClient: ObservableObject {
+final class HermesRemoteClient {
     nonisolated(unsafe) static let shared = HermesRemoteClient()
     static let maxFeedURLLength = 2_048
     static let maxFeedBytes = 10_000_000
@@ -22,21 +21,15 @@ final class HermesRemoteClient: ObservableObject {
     static let maxFieldLength = 512
     static let maxProviderLength = 256
 
-    struct SyncStatus: Equatable {
-        var lastSync: Int64 = 0
-        var lastRows: Int = 0
-        var error: String?
-    }
-
-    @Published private(set) var status = SyncStatus()
+    private static let legacyFeedKey = "remote_feed_url"
 
     private let queue = DispatchQueue(label: "toastmonitor.remote", qos: .utility)
     private let session: URLSession
     /// Retained: URLSession keeps its delegate weakly.
     private let redirectBlocker = NoRedirectDelegate()
-    private var lastPoll: Int64 = 0
+    private var lastPoll: [String: Int64] = [:]
     private var timer: Timer?
-    private var inFlight = false
+    private var inFlight: [String: [DispatchGroup]] = [:]
     private var started = false
 
     private init() {
@@ -80,30 +73,33 @@ final class HermesRemoteClient: ObservableObject {
         }
     }
 
-    /// Remote ingestion is opt-in. A local Mac installation therefore stays
-    /// fully usable without a Tailscale/VPS connection.
-    private var remoteSourcesEnabled: Bool {
-        ToolKind.allCases.contains { $0 != .openrouter && $0.sourceIsRemote }
+    private static func feedKey(for tool: ToolKind) -> String {
+        "\(legacyFeedKey)_\(tool.rawValue)"
     }
 
-    var feedURL: String {
-        Database.shared.setting("remote_feed_url") ?? ""
+    func feedURL(for tool: ToolKind, in database: any ParserStateStore = Database.shared) -> String {
+        // Existing configurations keep their feed until a tool saves its own.
+        // An explicitly empty value also overrides the old shared URL.
+        database.setting(Self.feedKey(for: tool)) ?? database.setting(Self.legacyFeedKey) ?? ""
     }
 
     @discardableResult
-    func provision(url: String?) -> Bool {
-        // Empty value clears the remote feed (back to local sources); not an error.
-        let trimmed = url?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if trimmed.isEmpty {
-            return Database.shared.setSetting("remote_feed_url", nil)
+    func provision(url: String, for tool: ToolKind, in database: Database = .shared) -> Bool {
+        let trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard tool.supportsRemoteSource, Self.feedURLProblem(trimmed) == nil else { return false }
+        let address = trimmed.isEmpty ? "" : URL(string: trimmed)?.absoluteString
+        return database.setSetting(Self.feedKey(for: tool), address)
+    }
+
+    static func feedURLProblem(_ address: String) -> String? {
+        if address.isEmpty { return nil }
+        if address.count > maxFeedURLLength { return "URL too long (max \(maxFeedURLLength) chars)" }
+        if address.rangeOfCharacter(from: .controlCharacters) != nil {
+            return "URL contains control characters"
         }
-        guard trimmed.count <= Self.maxFeedURLLength,
-              trimmed.rangeOfCharacter(from: .controlCharacters) == nil,
-              let parsed = URL(string: trimmed),
-              parsed.user == nil,
-              parsed.password == nil,
-              Self.isAllowedFeedURL(parsed) else { return false }
-        return Database.shared.setSetting("remote_feed_url", parsed.absoluteString)
+        guard let url = URL(string: address) else { return "Not a valid URL" }
+        guard isAllowedFeedURL(url) else { return "URL rejected. Use HTTPS or a private range." }
+        return nil
     }
 
     func start() {
@@ -124,20 +120,10 @@ final class HermesRemoteClient: ObservableObject {
 
     /// Called from the collector loop; rate-limited internally (60s).
     func maybePoll() {
-        guard remoteSourcesEnabled else {
-            clearRemoteHealth()
-            return
-        }
-        // Foreground uses the existing 15s timer. Background scans also call
-        // this method, but the serial-queue rate limit below reduces them to
-        // at most one feed request per 60s.
         // Keep the rate-limit check on the serial queue: lastPoll is only
         // mutated inside pollEnqueued, which always runs there.
         queue.async { [weak self] in
-            guard let self else { return }
-            let now = Int64(Date().timeIntervalSince1970)
-            guard now - self.lastPoll > 60 else { return }
-            self.pollEnqueued(completion: nil)
+            self?.pollEnqueued(tool: nil, rateLimited: true, completion: nil)
         }
     }
 
@@ -183,37 +169,51 @@ final class HermesRemoteClient: ObservableObject {
     /// `completion` is invoked on the main actor once this poll finishes —
     /// success or failure, including the skip paths where no network request
     /// is made.
-    func poll(completion: (@MainActor @Sendable () -> Void)? = nil) {
+    func poll(tool: ToolKind? = nil, completion: (@MainActor @Sendable () -> Void)? = nil) {
         queue.async { [weak self] in
-            guard let self else { return }
-            self.pollEnqueued(completion: completion)
+            self?.pollEnqueued(tool: tool, rateLimited: false, completion: completion)
         }
     }
 
-    /// The poll body. Runs on the serial queue only (see `poll`).
-    private func pollEnqueued(completion: (@MainActor @Sendable () -> Void)?) {
-        func finish() {
-            guard let completion else { return }
-            Task { @MainActor in completion() }
+    private func remoteTools(in database: any ParserStateStore, address: String? = nil) -> [ToolKind] {
+        ToolKind.allCases.filter { tool in
+            tool.sources(in: database).includesRemote
+                && (address == nil || feedURL(for: tool, in: database) == address)
         }
-        guard remoteSourcesEnabled else {
-            clearRemoteHealth()
-            finish()
-            return
-        }
-        guard !inFlight else { finish(); return }
-        inFlight = true
-        lastPoll = Int64(Date().timeIntervalSince1970)
+    }
 
-        guard feedURL.count <= Self.maxFeedURLLength,
-              feedURL.rangeOfCharacter(from: .controlCharacters) == nil,
-              let url = URL(string: feedURL),
-              Self.isAllowedFeedURL(url) else {
-            inFlight = false
-            publishStatus { $0.error = "Feed URL invalid or unsafe (HTTPS or private range only)" }
-            finish()
+    /// Runs on the serial queue. A feed shared by several tools is fetched once.
+    private func pollEnqueued(tool: ToolKind?, rateLimited: Bool,
+                              completion: (@MainActor @Sendable () -> Void)?) {
+        let feeds = Dictionary(grouping: remoteTools(in: Database.shared)) { feedURL(for: $0) }
+        lastPoll = lastPoll.filter { feeds[$0.key] != nil }
+        let now = Int64(Date().timeIntervalSince1970)
+        let group = DispatchGroup()
+        for (address, tools) in feeds {
+            if let tool, !tools.contains(tool) { continue }
+            guard !rateLimited || now - (lastPoll[address] ?? 0) > 60 else { continue }
+            lastPoll[address] = now
+            if let problem = address.isEmpty ? "Enter a feed URL" : Self.feedURLProblem(address) {
+                publishHealth(for: tools, address: address, error: problem)
+                continue
+            }
+            guard let url = URL(string: address) else { continue }
+            group.enter()
+            fetch(url, address: address, group: group)
+        }
+        if let completion {
+            group.notify(queue: .main) {
+                Task { @MainActor in completion() }
+            }
+        }
+    }
+
+    private func fetch(_ url: URL, address: String, group: DispatchGroup) {
+        if inFlight[address] != nil {
+            inFlight[address]?.append(group)
             return
         }
+        inFlight[address] = [group]
         var req = URLRequest(url: url)
         req.timeoutInterval = 15
         redirectBlocker.boundedDataTask(in: session, request: req,
@@ -224,78 +224,82 @@ final class HermesRemoteClient: ObservableObject {
             // not a nested queue.async inside pollEnqueued's own closure (it
             // runs later, off the queue), so there is no deadlock.
             self.queue.async {
-                defer { self.inFlight = false }
-                defer { finish() }
+                defer { self.inFlight.removeValue(forKey: address)?.forEach { $0.leave() } }
+                let tools = self.remoteTools(in: Database.shared, address: address)
+                guard !tools.isEmpty else { return }
+                func fail(_ message: String) {
+                    self.publishHealth(for: tools, address: address, error: message)
+                }
                 if let err {
-                    self.publishStatus { $0.error = err.localizedDescription }
+                    fail(err.localizedDescription)
                     return
                 }
                 guard let http = resp as? HTTPURLResponse else {
-                    self.publishStatus { $0.error = "No HTTP response" }
+                    fail("No HTTP response")
                     return
                 }
                 // Redirects are cancelled by the delegate; retain this
                 // final-URL check for custom URL loading implementations.
                 if !Self.isAllowedFeedURL(http.url ?? url) {
-                    self.publishStatus { $0.error = "Redirect to a disallowed address rejected" }
+                    fail("Redirect to a disallowed address rejected")
                     return
                 }
                 // Reject oversized responses from the Content-Length header
                 // before the body finishes buffering.
                 if http.expectedContentLength > Int64(Self.maxFeedBytes) {
-                    self.publishStatus { $0.error = "Response too large (>10MB)" }
+                    fail("Response too large (>10MB)")
                     return
                 }
                 guard http.statusCode == 200 else {
-                    self.publishStatus { $0.error = "HTTP \(http.statusCode)" }
+                    fail("HTTP \(http.statusCode)")
                     return
                 }
                 guard let data, data.count <= Self.maxFeedBytes else {
-                    self.publishStatus { $0.error = "Response too large (>10MB)" }
+                    fail("Response too large (>10MB)")
                     return
                 }
                 if let mime = http.mimeType, !mime.contains("json") {
-                    self.publishStatus { $0.error = "Non-JSON response (\(mime))" }
+                    fail("Non-JSON response (\(mime))")
                     return
                 }
                 guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                    self.publishStatus { $0.error = "Failed to parse response" }
+                    fail("Failed to parse response")
                     return
                 }
-                self.importFeed(obj)
+                self.importFeed(obj, from: address)
             }
         }.resume()
     }
 
-    /// With remote ingestion off, stale feed state must not linger in the UI.
-    private func clearRemoteHealth() {
+    private func publishHealth(for tools: [ToolKind], address: String, error: String?,
+                               imported: [ToolKind: Int] = [:], failed: Int = 0) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            if self.status != SyncStatus() { self.status = SyncStatus() }
-            SourceHealthHub.shared.purgeRemote()
-        }
-    }
-
-    private func publishStatus(_ update: @escaping (inout SyncStatus) -> Void) {
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            update(&self.status)
-            if let error = self.status.error {
-                NSLog("[ToastMonitor] remote feed error: %@", error)
+            for tool in tools where tool.sources().includesRemote && self.feedURL(for: tool) == address {
+                SourceHealthHub.shared.record(tool: tool.rawValue, mode: "remote",
+                                              rows: imported[tool] ?? 0, failed: failed,
+                                              durationMs: 0, error: error)
             }
         }
     }
-    func importFeed(_ result: [String: Any], database: Database = .shared) {
+
+    func importFeed(_ result: [String: Any], from address: String? = nil, database: Database = .shared) {
+        let state = StagedParserStateStore(database: database, sourcePaths: [])
+        let tools = remoteTools(in: state, address: address)
+        guard !tools.isEmpty else { return }
+        func report(_ error: String) {
+            if let address { publishHealth(for: tools, address: address, error: error) }
+        }
         guard let rows = result["rows"] as? [[String: Any]],
               rows.count <= Self.maxFeedRows else {
-            publishStatus { $0.error = "Feed format invalid or too many rows" }
+            report("Feed format invalid or too many rows")
             return
         }
         if let schema = result["schema"] as? Int, schema > 1 {
-            publishStatus { $0.error = "Unsupported feed schema v\(schema)" }
+            report("Unsupported feed schema v\(schema)")
             return
         }
-        let sourceDigest = SHA256.hash(data: Data(feedURL.utf8))
+        let sourceDigest = SHA256.hash(data: Data((address ?? state.setting(Self.legacyFeedKey) ?? "").utf8))
             .prefix(8).map { String(format: "%02x", $0) }.joined()
         let sourceInstance = "remote:\(sourceDigest)"
 
@@ -311,22 +315,13 @@ final class HermesRemoteClient: ObservableObject {
 
         var turns: [TurnRecord] = []
         var sessions: [String: SessionInfo] = [:]
-        var pendingHermesBaselines: [(key: String, value: String)] = []
-        var pendingOpenCodeTotals: [(key: String, input: Int64, output: Int64, reasoning: Int64, cacheRead: Int64, cacheWrite: Int64, cost: Double, updated: Int64)] = []
         var pendingWatermarks: [ToolKind: Cursor] = [:]
-        var seenRemoteTools: Set<String> = []
         var unknownTools = 0
         var malformedRows = 0
-        let totals = database.sessionTotals() // once per poll
-        // Resolve the remote-source set once per poll instead of
-        // hitting the settings table for every row.
-        let toolRemoteSources = Set(ToolKind.allCases.filter {
-            (database.setting($0.sourceKey) ?? $0.defaultSource) == "remote"
-        })
-        // Running baselines: a later row for the same key in this poll
-        // must compute against the previous row's write, not the stale
-        // committed value, or the cumulative delta is inserted twice.
-        var runningHermes: [String: [Int64]] = [:]
+        let totals = state.sessionTotals()
+        let toolRemoteSources = Set(tools)
+        // Track updated OpenCode totals without rebuilding the totals
+        // snapshot for every row. Hermes reads its staged settings directly.
         var runningOpenCode: [String: (tool: String, input: Int64, output: Int64, reasoning: Int64, cacheRead: Int64, cacheWrite: Int64, cost: Double)] = [:]
         let nowTs = Int64(Date().timeIntervalSince1970)
         // Feed rows outside this window are rejected (a future-dated row
@@ -341,7 +336,6 @@ final class HermesRemoteClient: ObservableObject {
                 continue
             }
             guard toolRemoteSources.contains(tool) else { continue }
-            seenRemoteTools.insert(tool.rawValue)
             guard let rawSession = row["session_id"] as? String,
                   !rawSession.isEmpty, rawSession.count <= Self.maxFieldLength,
                   rawSession.rangeOfCharacter(from: .controlCharacters) == nil else {
@@ -443,7 +437,7 @@ final class HermesRemoteClient: ObservableObject {
                 let local: [Int64] = totals[HermesUsageBaseline.localTotalsKey(key)]
                     .map { [$0.input, $0.output, $0.reasoning, $0.cacheRead, $0.cacheWrite, 0] } ?? []
                 let prev = HermesUsageBaseline.merge(current: current, baselines: [local,
-                    runningHermes[key] ?? HermesUsageBaseline.parse(database.setting(key))])
+                    HermesUsageBaseline.parse(state.setting(key))])
                 let step = HermesUsageBaseline.advance(
                     current: .init(input: input, output: output, reasoning: reasoning,
                                    cacheRead: cacheRead, cacheWrite: cacheWrite),
@@ -454,9 +448,11 @@ final class HermesRemoteClient: ObservableObject {
                 dReasoning = step.delta.reasoning
                 dCacheRead = step.delta.cacheRead
                 dCacheWrite = step.delta.cacheWrite
-                let encoded = HermesUsageBaseline.encode(step.base)
-                runningHermes[key] = HermesUsageBaseline.parse(encoded)
-                pendingHermesBaselines.append((key, encoded))
+                let base = step.base
+                state.setSetting(key, HermesUsageBaseline.encode(base))
+                state.setSessionTotals(HermesUsageBaseline.localTotalsKey(key), tool: "hermes",
+                                       input: base.input, output: base.output, reasoning: base.reasoning,
+                                       cacheRead: base.cacheRead, cacheWrite: base.cacheWrite, cost: 0, updated: nowTs)
                 dCost = 0
                 costQuality = "unknown"
             case .opencode:
@@ -482,8 +478,9 @@ final class HermesRemoteClient: ObservableObject {
                 let safeCost = prev.map { max(cost, $0.cost) } ?? cost
                 runningOpenCode[totalsKey] = ("opencode", safeInput, safeOutput, safeReasoning,
                                               safeRead, safeWrite, safeCost)
-                pendingOpenCodeTotals.append((totalsKey, safeInput, safeOutput, safeReasoning,
-                                              safeRead, safeWrite, safeCost, lastSeenS))
+                state.setSessionTotals(totalsKey, tool: "opencode", input: safeInput, output: safeOutput,
+                                       reasoning: safeReasoning, cacheRead: safeRead, cacheWrite: safeWrite,
+                                       cost: safeCost, updated: lastSeenS)
                 costQuality = hasReportedCost ? "actual" : "unknown"
             default:
                 break // per-turn events: insert as-is
@@ -521,60 +518,32 @@ final class HermesRemoteClient: ObservableObject {
             }
         }
 
-        // Atomic commit: turns + sessions + cumulative baselines + watermarks
-        // are one unit. A failed write must leave the feed replayable.
+        for (tool, value) in pendingWatermarks {
+            state.setSetting("remote_watermark_\(tool.rawValue)", "\(value.ts)")
+        }
+        // A concurrent local scan can advance a shared baseline while this
+        // feed is being parsed. Revalidate before committing either delta.
         let ok = database.inTransaction {
-            var writesOK = database.insertTurns(turns)
-            writesOK = database.upsertSessions(Array(sessions.values)) && writesOK
-            for p in pendingHermesBaselines {
-                writesOK = database.setSetting(p.key, p.value) && writesOK
-                let base = HermesUsageBaseline.parse(p.value)
-                writesOK = database.setSessionTotals(HermesUsageBaseline.localTotalsKey(p.key), tool: "hermes",
-                    input: base[0], output: base[1], reasoning: base[2], cacheRead: base[3], cacheWrite: base[4],
-                    cost: 0, updated: nowTs) && writesOK
-            }
-            for p in pendingOpenCodeTotals {
-                writesOK = database.setSessionTotals(p.key, tool: "opencode",
-                                                      input: p.input, output: p.output,
-                                                      reasoning: p.reasoning,
-                                                      cacheRead: p.cacheRead, cacheWrite: p.cacheWrite,
-                                                      cost: p.cost, updated: p.updated) && writesOK
-            }
-            for (tool, value) in pendingWatermarks {
-                // Diagnostic-only: persist just the timestamp.
-                writesOK = database.setSetting("remote_watermark_\(tool.rawValue)",
-                                               "\(value.ts)") && writesOK
-            }
-            return writesOK
+            state.validateForCommit()
+                && database.insertTurns(turns)
+                && database.upsertSessions(Array(sessions.values))
+                && state.apply()
         }
         guard ok else {
-            publishStatus { $0.error = "Import transaction failed, watermark not advanced" }
+            report("Source changed or write failed. Retrying on the next pull.")
             return
         }
         let ignoredRows = unknownTools + malformedRows
         let errorText = ignoredRows > 0 ? "\(ignoredRows) invalid/unknown rows ignored" : nil
-        let syncTime = Int64(Date().timeIntervalSince1970)
         let importedTurnCount = turns.count
-        let importedByTool = turns.reduce(into: [String: Int]()) { counts, turn in
-            counts[turn.tool.rawValue, default: 0] += 1
-        }
-        publishStatus {
-            $0.lastSync = syncTime
-            $0.lastRows = importedTurnCount
-            $0.error = errorText
+        if let address {
+            let importedByTool = turns.reduce(into: [ToolKind: Int]()) { counts, turn in
+                counts[turn.tool, default: 0] += 1
+            }
+            publishHealth(for: tools, address: address, error: errorText,
+                          imported: importedByTool, failed: ignoredRows)
         }
         Task { @MainActor in
-            for tool in seenRemoteTools {
-                let imported = importedByTool[tool] ?? 0
-                SourceHealthHub.shared.record(tool: tool, rows: imported, failed: 0,
-                                              durationMs: 0, error: nil)
-            }
-            // Always record the remote-feed outcome. A successful poll must
-            // clear a prior malformed-row error, otherwise the aggregate
-            // popover status remains red forever after the feed recovers.
-            SourceHealthHub.shared.record(tool: "remote-feed", rows: importedTurnCount,
-                                          failed: ignoredRows, durationMs: 0,
-                                          error: errorText)
             // Remote import completes after the collector's local scan
             // notification. Publish the same refresh signal so the menu bar
             // and dashboard do not wait for the next snapshot poll.

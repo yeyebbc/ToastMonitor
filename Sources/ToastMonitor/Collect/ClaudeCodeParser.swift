@@ -74,7 +74,7 @@ enum ClaudeCodeParser {
 
     /// Returns (turns, sessions) parsed from all changed files.
     static func scan(knownPaths: [String], database: any ParserStateStore = Database.shared) -> (turns: [TurnRecord], sessions: [SessionInfo]) {
-        guard !ToolKind.claude.sourceIsRemote else { return ([], []) }
+        guard ToolKind.claude.sources(in: database).includesLocal else { return ([], []) }
         var turns: [TurnRecord] = []
         var sessions: [SessionInfo] = []
         var indexByEvent: [String: Int] = [:]

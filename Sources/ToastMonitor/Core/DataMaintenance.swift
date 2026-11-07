@@ -16,11 +16,11 @@ enum DataMaintenance {
 
     /// Logs a rebuild can read back: only these sessions are ever removed.
     private static func localLogs() -> (claude: [String], codex: [String]) {
-        let claude = ToolKind.claude.sourceIsRemote ? [] :
-            (FileScanner.listFiles(ClaudeCodeParser.root, maxDepth: 4)
-                + ClaudeCodeParser.listCoworkFiles()).filter { $0.hasSuffix(".jsonl") }
-        let codex = ToolKind.codex.sourceIsRemote ? [] :
-            FileScanner.listFiles(CodexParser.sessionsRoot, maxDepth: 4).filter { $0.hasSuffix(".jsonl") }
+        let claude = ToolKind.claude.sources().includesLocal
+            ? (FileScanner.listFiles(ClaudeCodeParser.root, maxDepth: 4)
+                + ClaudeCodeParser.listCoworkFiles()).filter { $0.hasSuffix(".jsonl") } : []
+        let codex = ToolKind.codex.sources().includesLocal
+            ? FileScanner.listFiles(CodexParser.sessionsRoot, maxDepth: 4).filter { $0.hasSuffix(".jsonl") } : []
         return (claude, codex)
     }
 
@@ -132,7 +132,7 @@ enum DataMaintenance {
     }
 
     static func repair() throws -> DataRepairReceipt {
-        guard !ToolKind.claude.sourceIsRemote || !ToolKind.codex.sourceIsRemote else {
+        guard ToolKind.claude.sources().includesLocal || ToolKind.codex.sources().includesLocal else {
             throw MaintenanceError.noLocalSources
         }
         let logs = localLogs()

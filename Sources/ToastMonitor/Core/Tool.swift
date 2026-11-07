@@ -1,5 +1,21 @@
 import SwiftUI
 
+enum UsageSources: String {
+    case local, remote, both, off
+
+    var includesLocal: Bool { self == .local || self == .both }
+    var includesRemote: Bool { self == .remote || self == .both }
+
+    init(local: Bool, remote: Bool) {
+        switch (local, remote) {
+        case (true, true): self = .both
+        case (true, false): self = .local
+        case (false, true): self = .remote
+        case (false, false): self = .off
+        }
+    }
+}
+
 /// The AI tools ToastMonitor tracks, plus the cloud quota panel.
 enum ToolKind: String, CaseIterable, Identifiable {
     case claude = "claude"
@@ -51,12 +67,11 @@ enum ToolKind: String, CaseIterable, Identifiable {
         }
     }
 
-    // MARK: - Source configuration (local Mac vs remote VPS)
+    // MARK: - Source configuration
 
-    /// Where this tool's usage logs are read from.
-    /// "local" = this Mac's files; "remote" = the VPS usage feed.
-    var sourceIsRemote: Bool {
-        (Database.shared.setting(sourceKey) ?? defaultSource) == "remote"
+    func sources(in database: any ParserStateStore = Database.shared) -> UsageSources {
+        guard supportsRemoteSource, let raw = database.setting(sourceKey) else { return .local }
+        return UsageSources(rawValue: raw) ?? .local
     }
 
     /// Whether this collector has a remote-feed implementation. Oh My Pi and
@@ -72,18 +87,12 @@ enum ToolKind: String, CaseIterable, Identifiable {
     }
 
     @discardableResult
-    func setSource(remote: Bool) -> Bool {
-        guard !remote || supportsRemoteSource else { return false }
-        return Database.shared.setSetting(sourceKey, remote ? "remote" : "local")
+    func setSources(_ sources: UsageSources, in database: Database = .shared) -> Bool {
+        guard supportsRemoteSource || sources == .local else { return false }
+        return database.setSetting(sourceKey, sources.rawValue)
     }
 
     var sourceKey: String { "src_\(rawValue)" }
-
-    /// Local-first default. A remote feed is an explicit opt-in in Settings;
-    /// a fresh Mac install must not silently depend on a VPS being reachable.
-    var defaultSource: String {
-        "local"
-    }
 
     /// Primary token measure: input + output + cache reads. Codex is the
     /// exception: its input already includes cache reads.

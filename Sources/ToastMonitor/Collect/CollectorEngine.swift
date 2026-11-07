@@ -262,6 +262,7 @@ final class CollectorEngine: @unchecked Sendable {
                     sourcePaths: [String],
                     scan: (any ParserStateStore) -> (turns: [TurnRecord], sessions: [SessionInfo]),
                     signaturePath: String? = nil, signaturePaths: [String] = []) {
+            guard ToolKind(rawValue: source)?.sources().includesLocal == true else { return }
             let sourceStart = CFAbsoluteTimeGetCurrent()
             if sourceRetry.isWaiting(source) { return }
             guard preflight() else {
@@ -315,19 +316,19 @@ final class CollectorEngine: @unchecked Sendable {
             }
         }
 
-        let claudeFiles = (FileScanner.listFiles(ClaudeCodeParser.root, maxDepth: 4)
-            + ClaudeCodeParser.listCoworkFiles())
-            .filter { $0.hasSuffix(".jsonl") }
-        let codexFiles = FileScanner.listFiles(CodexParser.sessionsRoot, maxDepth: 4)
-            .filter { $0.hasSuffix(".jsonl") }
-        let dshLogFiles = (!ToolKind.dsh.sourceIsRemote && DSHParser.resolveMode() == .log)
+        let claudeFiles = ToolKind.claude.sources().includesLocal
+            ? (FileScanner.listFiles(ClaudeCodeParser.root, maxDepth: 4) + ClaudeCodeParser.listCoworkFiles())
+                .filter { $0.hasSuffix(".jsonl") } : []
+        let codexFiles = ToolKind.codex.sources().includesLocal
+            ? FileScanner.listFiles(CodexParser.sessionsRoot, maxDepth: 4)
+                .filter { $0.hasSuffix(".jsonl") } : []
+        let dshLogFiles = DSHParser.resolveMode() == .log
             ? DSHParser.listSessionFiles() : []
         Database.shared.recountMiscountedUsage(
-            claudePaths: ToolKind.claude.sourceIsRemote ? [] : claudeFiles,
-            codexPaths: ToolKind.codex.sourceIsRemote ? [] : codexFiles,
+            claudePaths: claudeFiles,
+            codexPaths: codexFiles,
             dshPaths: dshLogFiles)
-        Database.shared.replayClaudeForCacheSplit(
-            paths: ToolKind.claude.sourceIsRemote ? [] : claudeFiles)
+        Database.shared.replayClaudeForCacheSplit(paths: claudeFiles)
 
         ingest("claude", preflight: { self.fileSourcesChanged(claudeFiles) },
                sourcePaths: claudeFiles) { state in

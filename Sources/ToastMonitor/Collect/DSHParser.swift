@@ -197,7 +197,6 @@ enum DSHParser {
     static func scanLogs(knownPaths: [String], database: any ParserStateStore = Database.shared,
                          decompress: (Data) -> Data? = { Zstd.decompress($0) })
         -> (turns: [TurnRecord], sessions: [SessionInfo]) {
-        guard !ToolKind.dsh.sourceIsRemote else { return ([], []) }
         var turns: [TurnRecord] = []
         var sessions: [SessionInfo] = []
         for file in knownPaths {
@@ -658,7 +657,6 @@ enum DSHParser {
     /// `session_totals` baseline and the positive delta becomes one turn.
     static func scanProjCache(database: any ParserStateStore = Database.shared)
         -> (turns: [TurnRecord], sessions: [SessionInfo]) {
-        guard !ToolKind.dsh.sourceIsRemote else { return ([], []) }
         guard FileManager.default.fileExists(atPath: projCachePath),
               let data = try? Data(contentsOf: URL(fileURLWithPath: projCachePath)),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],

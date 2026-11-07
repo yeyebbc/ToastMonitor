@@ -111,7 +111,7 @@ enum OpenCodeParser {
     }
 
     static func scan(database: any ParserStateStore = Database.shared) -> (turns: [TurnRecord], sessions: [SessionInfo]) {
-        guard !ToolKind.opencode.sourceIsRemote else { return ([], []) }
+        guard ToolKind.opencode.sources(in: database).includesLocal else { return ([], []) }
         var turns: [TurnRecord] = []
         var sessions: [SessionInfo] = []
         let prevTotals = database.sessionTotals()

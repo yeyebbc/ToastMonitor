@@ -37,7 +37,7 @@ enum HermesParser {
     }
 
     static func scan(database: any ParserStateStore = Database.shared) -> (turns: [TurnRecord], sessions: [SessionInfo]) {
-        guard !ToolKind.hermes.sourceIsRemote else { return ([], []) }
+        guard ToolKind.hermes.sources(in: database).includesLocal else { return ([], []) }
         var turns: [TurnRecord] = []
         var sessions: [SessionInfo] = []
         for path in dbPaths {

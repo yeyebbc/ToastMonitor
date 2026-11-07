@@ -15,11 +15,16 @@ final class UIStateTests: XCTestCase {
         XCTAssertEqual(state?.failedRows, 0)
     }
 
-    func testSourceHealthDisplayNameIdentifiesRemoteFeed() {
-        let remote = SourceHealth(tool: "remote-feed", mode: "remote")
-        XCTAssertEqual(remote.displayName, "Remote Feed")
-        let omp = SourceHealth(tool: ToolKind.omp.rawValue, mode: "local")
-        XCTAssertEqual(omp.displayName, ToolKind.omp.displayName)
+    func testSourceHealthSeparatesLocalAndRemoteForTheSameTool() {
+        let tool = "ui-state-\(UUID().uuidString)"
+        SourceHealthHub.shared.record(tool: tool, mode: "remote", rows: 0, failed: 0,
+                                      durationMs: 0, error: "remote offline")
+        SourceHealthHub.shared.recordIdle(tool: tool, durationMs: 1)
+        let states = SourceHealthHub.shared.sources.filter { $0.tool == tool }
+        XCTAssertEqual(Set(states.map(\.id)).count, 2)
+        XCTAssertEqual(states.first { $0.mode == "remote" }?.error, "remote offline")
+        let remote = SourceHealth(tool: ToolKind.hermes.rawValue, mode: "remote")
+        XCTAssertEqual(remote.displayName, "Hermes (Remote)")
     }
 
     func testHealthStatusPrecedenceIsStable() {

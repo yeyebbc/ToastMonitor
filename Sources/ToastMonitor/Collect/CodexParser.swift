@@ -171,7 +171,7 @@ enum CodexParser {
     /// path; the collector passes the list it already walked.
     static func scan(files explicitFiles: [String]? = nil,
                      database: any ParserStateStore = Database.shared) -> (turns: [TurnRecord], sessions: [SessionInfo]) {
-        guard !ToolKind.codex.sourceIsRemote else { return ([], []) }
+        guard ToolKind.codex.sources(in: database).includesLocal else { return ([], []) }
         var turns: [TurnRecord] = []
         var sessions: [SessionInfo] = []
         let files: [String]

@@ -26,11 +26,10 @@ http://TAILSCALE_IP:PORT/usage.json
 
 ## 连接步骤
 
-1. 打开 ToastMonitor，进入完整面板的 **Settings** 页面。
-2. 找到 **Remote Feed**，粘贴完整的 Feed URL，然后点击 **Save**。
-3. 在同一页面的 **Data Sources** 中，把 **Hermes** 从 **Local** 切换为 **Remote**。
-4. 点击 **Test connection**。
-5. 看到 `Scan complete`，并且 **Remote Feed** 显示 `Synced`，即表示连接成功。
+1. 打开 ToastMonitor，进入 **Settings → Sources**。
+2. 在 **Data Sources** 中勾选 **Hermes** 旁的 **Remote**。如需同时采集本机用量，保留 **Local** 的勾选。
+3. 在 **Hermes** 下方粘贴完整的 Feed URL，然后点击 **Save**。
+4. 当 **Hermes** 下方显示 `Synced` 时，表示连接成功。
 
 `Imported 0 rows` 或 `up to date` 不一定是错误，通常表示这次同步没有发现新的用量记录。
 
@@ -75,7 +74,7 @@ curl -sS -o /dev/null --max-time 15 \
 
 ## 停用远程连接
 
-1. 在 **Data Sources** 中把 **Hermes** 改回 **Local**。
-2. 如需删除远程地址，清空 **Remote Feed** 输入框并点击 **Save**。
+1. 如需删除远程地址，先清空 **Hermes** 下方的 Feed URL 输入框并点击 **Save**。
+2. 取消勾选 **Hermes** 旁的 **Remote**，即可停止远程采集。
 
 分享截图或错误日志前，请遮盖真实域名、IP、端口、项目名、会话 ID 和 Feed 内容。
